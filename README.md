@@ -1,5 +1,7 @@
 # StreamRL with SPR
 
+Paper : [Squeezing More from the Stream : Learning Representation Online for Streaming Reinforcement Learning](https://www.arxiv.org/abs/2602.09396)
+
 Evaluation of Self-Predictive Representations (SPR) combined with streaming reinforcement learning algorithms on Atari environments.
 
 ## Overview
