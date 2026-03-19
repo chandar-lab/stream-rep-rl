@@ -11,7 +11,13 @@
 #SBATCH --output=logs_slurm/%x-%j.out
 #SBATCH --error=logs_slurm/%x-%j.err
 
-source "$(dirname "$0")/common.sh"
+if [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "${SLURM_SUBMIT_DIR}/common.sh" ]; then
+    source "${SLURM_SUBMIT_DIR}/common.sh"
+elif [ -n "${SLURM_SUBMIT_DIR:-}" ] && [ -f "${SLURM_SUBMIT_DIR}/slurm/common.sh" ]; then
+    source "${SLURM_SUBMIT_DIR}/slurm/common.sh"
+else
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+fi
 
 EXP_CLASS="rebuttal-A4"
 BETAS=(0.9 0.95 0.99 0.999)

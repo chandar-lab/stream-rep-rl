@@ -15,7 +15,7 @@
 
 set -e
 cd "$(dirname "$0")"
-mkdir -p ../logs_slurm
+mkdir -p logs_slurm
 
 echo "================================================"
 echo "  Rebuttal Ablation Experiment Launcher"

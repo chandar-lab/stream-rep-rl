@@ -88,7 +88,6 @@ launch_runs() {
                 --log_dir "$CHECKPOINT_DIR" \
                 --track \
                 --resume \
-                --save_model \
                 --total_timesteps 10000000 \
                 --explore_frac 0.10 \
                 $extra_args &
@@ -112,7 +111,6 @@ launch_runs_minatar() {
                 --seed "$SEED" \
                 --track \
                 --resume \
-                --save_model \
                 --total_timesteps 5000000 \
                 $extra_args &
         done
