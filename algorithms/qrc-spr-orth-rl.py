@@ -137,6 +137,9 @@ class Args:
     orth_beta: float = 0.99
     """EMA momentum factor for orthogonal gradient projection"""
 
+    orth_rl: bool = True
+    """whether to apply orthogonal gradient projection to RL gradients"""
+
     max_grad: float = 100.0
     """maximum gradient norm for clipping"""
 
@@ -535,6 +538,7 @@ class AgentState(NamedTuple):
     spr_momentum_proj: Optional[jnp.ndarray]  # None if shared_online_proj is True
     spr_momentum_pred: Optional[jnp.ndarray]
     spr_momentum_trans: Optional[jnp.ndarray]
+    rl_momentum: Optional[jnp.ndarray]  # momentum for RL gradient decorrelation
 
 
 @partial(jax.jit, static_argnames=["action_dim"])
@@ -707,6 +711,9 @@ def init_agent_state_qrc_agent(
     spr_momentum_pred = jax.tree.map(jnp.zeros_like, predictor_state.params)
     spr_momentum_trans = jax.tree.map(jnp.zeros_like, transition_state.params)
 
+    # Initialize RL gradient momentum for orthogonal projection
+    rl_momentum = jax.tree.map(jnp.zeros_like, train_states[0].params)
+
     return (
         AgentState(
             agent_config,
@@ -723,6 +730,7 @@ def init_agent_state_qrc_agent(
             spr_momentum_proj,
             spr_momentum_pred,
             spr_momentum_trans,
+            rl_momentum,
         ),
         rng,
     )
@@ -815,6 +823,7 @@ def update_step_qrc_agent(
     spr_momentum_proj = agent_state.spr_momentum_proj
     spr_momentum_pred = agent_state.spr_momentum_pred
     spr_momentum_trans = agent_state.spr_momentum_trans
+    rl_momentum = agent_state.rl_momentum
 
     # QRC-lambda updates
     def get_q(params):
@@ -860,6 +869,11 @@ def update_step_qrc_agent(
             tree.scale(-h_t, q_grads),
             q_update,
         )
+
+    # Apply orthogonal gradient projection to RL gradients if enabled
+    if config.orth_rl:
+        q_update = orthogonal_gradient_projection(q_update, rl_momentum)
+        rl_momentum = update_momentum(rl_momentum, q_update, config.orth_beta)
 
     # SPR loss computation
     spr_loss = 0.0
@@ -1130,6 +1144,7 @@ def update_step_qrc_agent(
             spr_momentum_proj,
             spr_momentum_pred,
             spr_momentum_trans,
+            rl_momentum,
         ),
         metrics,
     )
@@ -1287,6 +1302,10 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 agent_state.spr_momentum_trans,
                 checkpoint_data.get("spr_momentum_trans"),
             )
+            new_rl_momentum = restore_momentum(
+                agent_state.rl_momentum,
+                checkpoint_data.get("rl_momentum"),
+            )
 
             agent_state = AgentState(
                 agent_config=agent_state.agent_config,
@@ -1304,6 +1323,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 spr_momentum_proj=new_spr_momentum_proj,
                 spr_momentum_pred=new_spr_momentum_pred,
                 spr_momentum_trans=new_spr_momentum_trans,
+                rl_momentum=new_rl_momentum,
             )
 
             if "traj_buffer" in checkpoint_data:
@@ -1482,6 +1502,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 "spr_momentum_proj": save_momentum(agent_state.spr_momentum_proj),
                 "spr_momentum_pred": save_momentum(agent_state.spr_momentum_pred),
                 "spr_momentum_trans": save_momentum(agent_state.spr_momentum_trans),
+                "rl_momentum": save_momentum(agent_state.rl_momentum),
                 "traj_buffer": flax.serialization.to_bytes(traj_buffer),
                 "rng": rng,
                 "episodes": episodes,

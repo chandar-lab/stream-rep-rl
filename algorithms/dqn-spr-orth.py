@@ -8,6 +8,7 @@ from typing import Callable, NamedTuple, Optional, List
 from dataclasses import dataclass
 import gymnasium as gym
 import itertools
+from utils import normalization
 import wandb
 from functools import partial
 import jax
@@ -39,7 +40,6 @@ from utils.atari_wrappers import (
     MaxAndSkipEnv,
     NoopResetEnv,
 )
-
 from utils.store_episode_returns_and_lengths import (
     StoreEpisodeReturnsAndLengths,
 )
@@ -58,9 +58,9 @@ class Args:
     """seed of the experiment"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "None"
+    wandb_project_name: str = None
     """the wandb's project name"""
-    wandb_entity: str = "None"
+    wandb_entity: str = None
     """the entity (team) of wandb's project"""
     exp_class: str = "tmp"
     """the class of the experiment"""
@@ -77,6 +77,7 @@ class Args:
     log_dir: str = "logs"
     """the logging directory"""
     env_type: str = "octax"
+    """the type of environment"""
 
     # Algorithm specific arguments
     env_id: str = "filter"
@@ -129,15 +130,19 @@ class Args:
     """lambda - weight for SPR loss"""
     spr_tau: float = 0.99
     """EMA coefficient for target network (0.0 to disable)"""
+    dqn_tau: float = 0.995
+    """EMA coefficient for DQN target network"""
     shared_online_proj: bool = True
     """whether to share projection head between Q-network and SPR"""
     use_augmentation: bool = False
     """whether to use data augmentation for SPR"""
 
+    use_orth: bool = True
+    """whether to use orthogonal gradient projection for SPR"""
     orth_beta: float = 0.99
     """EMA momentum factor for orthogonal gradient projection"""
 
-    max_grad: float = 100.0
+    max_grad: float = 20.0
     """maximum gradient norm for clipping"""
 
 
@@ -245,15 +250,9 @@ def make_env(args, idx, run_name):
 
             # Episode statistics wrapper
             env = RecordEpisodeStatistics(env)
-            from utils.store_episode_returns_and_lengths import (
-                StoreEpisodeReturnsAndLengths,
-            )
-
             env = StoreEpisodeReturnsAndLengths(env)
 
             # Normalization must come after stats for correct results
-            from utils import normalization
-
             env = normalization.ScaleReward(env, gamma=args.gamma)
             env = normalization.NormalizeObservation(env)
 
@@ -515,24 +514,66 @@ def cosine_similarity_loss(pred, target):
     return -cos_sim
 
 
+def orthogonal_gradient_projection(grad_t, momentum_t):
+    """
+    Compute orthogonal gradient by projecting out component parallel to momentum.
+
+    ut = gt - proj_ct-1(gt)
+    where proj_ct-1(gt) = (gt . ct-1) / (ct-1 . ct-1) * ct-1
+
+    Args:
+        grad_t: Current gradient (pytree)
+        momentum_t: EMA momentum of past gradients (pytree)
+
+    Returns:
+        Orthogonal gradient (pytree)
+    """
+    grad_flat, grad_treedef = jax.tree_util.tree_flatten(grad_t)
+    momentum_flat, _ = jax.tree_util.tree_flatten(momentum_t)
+
+    dot_grad_momentum = sum([jnp.sum(g * m) for g, m in zip(grad_flat, momentum_flat)])
+    dot_momentum_momentum = sum([jnp.sum(m * m) for m in momentum_flat])
+
+    epsilon = 1e-8
+    projection_coeff = dot_grad_momentum / (dot_momentum_momentum + epsilon)
+
+    orthogonal_grad = jax.tree.map(
+        lambda g, m: g - projection_coeff * m, grad_t, momentum_t
+    )
+
+    return orthogonal_grad
+
+
+def update_momentum(momentum_t, grad_t, beta):
+    """
+    Update EMA momentum with current gradient.
+
+    ct = beta * ct-1 + (1 - beta) * gt
+
+    Args:
+        momentum_t: Current momentum (pytree)
+        grad_t: Current gradient (pytree)
+        beta: Momentum factor (scalar)
+
+    Returns:
+        Updated momentum (pytree)
+    """
+    return jax.tree.map(lambda m, g: beta * m + (1.0 - beta) * g, momentum_t, grad_t)
+
+
 class AgentState(NamedTuple):
     agent_config: Config
     train_state: TrainState
-    h_state: TrainState
-    h_trace: jnp.ndarray  # the scalar trace for h (small z_t from the paper)
-    grad_h_trace: (
-        jnp.ndarray
-    )  # the trace of the gradient of h (z_t^{theta} from the paper)
-    grad_q_trace: jnp.ndarray  # the trace of the gradient of v (z_t^{w} from the paper)
+    target_q_state: TrainState
     # SPR components (optional)
     target_encoder_state: Optional[TrainState]
     proj_online_state: Optional[TrainState]
     proj_target_state: Optional[TrainState]
     predictor_state: Optional[TrainState]
     transition_state: Optional[TrainState]
-    # Orthogonal gradient momentum (EMA of past gradients for decorrelation)
+    # Orthogonal gradient momentum
     spr_momentum_online: Optional[jnp.ndarray]
-    spr_momentum_proj: Optional[jnp.ndarray]  # None if shared_online_proj is True
+    spr_momentum_proj: Optional[jnp.ndarray]
     spr_momentum_pred: Optional[jnp.ndarray]
     spr_momentum_trans: Optional[jnp.ndarray]
 
@@ -569,54 +610,88 @@ def agent_step(
     return action, is_nongreedy, rng_out
 
 
-def init_agent_state_qrc_agent(
+def init_agent_state_dqn(
     agent_config: Config,
     action_dim: int,
     obs_shape: tuple,
     rng: jax.random.PRNGKey,
     max_grad: float = 20.0,
 ):
-    net_kwargs = {
-        "action_dim": action_dim,
-        "layer_norm": agent_config.layer_norm,
-        "activation": agent_config.activation,
-        "kernel_init": sparse_init(sparsity=agent_config.sparse_init),
-        "kernel_sizes": ((8, 8), (4, 4), (3, 3)),
-        "strides_list": ((4, 4), (2, 2), (1, 1)),
-    }
+    # Set up net_kwargs based on env_type
+    env_type = getattr(agent_config, "env_type", "atari")
+    if env_type == "atari":
+        net_kwargs = {
+            "action_dim": action_dim,
+            "layer_norm": agent_config.layer_norm,
+            "activation": agent_config.activation,
+            "kernel_init": sparse_init(sparsity=agent_config.sparse_init),
+            "features_list": (32, 64, 64),
+            "kernel_sizes": ((8, 8), (4, 4), (3, 3)),
+            "strides_list": ((4, 4), (2, 2), (1, 1)),
+            "hidden_layer_sizes": (256,),
+            "dyn_features_list": (64, 64),
+            "dyn_kernel_sizes": ((3, 3), (3, 3)),
+            "dyn_strides_list": ((1, 1), (1, 1)),
+        }
+    elif env_type == "octax":
+        net_kwargs = {
+            "action_dim": action_dim,
+            "layer_norm": agent_config.layer_norm,
+            "activation": agent_config.activation,
+            "kernel_init": sparse_init(sparsity=agent_config.sparse_init),
+            "features_list": (32, 64, 64),
+            "kernel_sizes": ((4, 8), (4, 4), (3, 3)),
+            "strides_list": ((2, 4), (2, 2), (1, 1)),
+            "hidden_layer_sizes": (256,),
+            "dyn_features_list": (64, 64),
+            "dyn_kernel_sizes": ((3, 3), (3, 3)),
+            "dyn_strides_list": ((1, 1), (1, 1)),
+        }
+    elif env_type == "minatar":
+        net_kwargs = {
+            "action_dim": action_dim,
+            "layer_norm": agent_config.layer_norm,
+            "activation": agent_config.activation,
+            "kernel_init": sparse_init(sparsity=agent_config.sparse_init),
+            "features_list": (16,),
+            "kernel_sizes": ((3, 3),),
+            "strides_list": ((1, 1),),
+            "hidden_layer_sizes": (128,),
+            "dyn_features_list": (16, 16),
+            "dyn_kernel_sizes": ((3, 3), (3, 3)),
+            "dyn_strides_list": ((1, 1), (1, 1)),
+        }
+    else:
+        raise ValueError(f"unknown env_type: {env_type}")
+
     net_arch = agent_config.net_arch
     if net_arch == "mlp":
         net_kwargs["hiddens"] = agent_config.mlp_layers
 
-    train_states = []
-    lrs = [agent_config.q_lr, agent_config.h_lr_scale * agent_config.q_lr]
+    # Initialize Q-network
+    network = OctaxQNetworkSPR(**net_kwargs)
+    init_x = jnp.zeros(obs_shape)
 
-    # one network for q and one for h
-    for net in range(2):
-        # For SPR, we use OctaxQNetworkSPR for all env types since it has the encoder structure
-        network = OctaxQNetworkSPR(**net_kwargs)
-        init_x = jnp.zeros(obs_shape)
+    rng, _rng = jax.random.split(rng)
+    params = network.init(_rng, init_x)
 
-        rng, _rng = jax.random.split(rng)
-        params = network.init(_rng, init_x)
+    tx = optax.chain(
+        optax.clip_by_global_norm(max_grad),
+        getattr(optax, agent_config.opt)(agent_config.q_lr),
+    )
 
-        # Use gradient clipping for stability
-        tx = optax.chain(
-            optax.clip_by_global_norm(max_grad),
-            getattr(optax, agent_config.opt)(lrs[net]),
-        )
+    train_state = TrainState.create(
+        apply_fn=network.apply,
+        params=params,
+        tx=tx,
+    )
 
-        train_states.append(
-            TrainState.create(
-                apply_fn=network.apply,
-                params=params,
-                tx=tx,
-            )
-        )
-
-    grad_h_trace = jax.tree.map(jnp.zeros_like, train_states[1].params)
-    grad_v_trace = jax.tree.map(jnp.zeros_like, train_states[0].params)
-    h_trace = 0.0
+    # Initialize Target Q-network
+    target_q_state = TrainState.create(
+        apply_fn=network.apply,
+        params=params,
+        tx=optax.sgd(0),
+    )
 
     # Target encoder
     target_encoder = OctaxTargetEncoder(**net_kwargs)
@@ -627,6 +702,9 @@ def init_agent_state_qrc_agent(
         params=target_encoder_params,
         tx=getattr(optax, agent_config.opt)(agent_config.q_lr),
     )
+
+    # Infer latent shape by running a dummy pass through target encoder
+    dummy_out = target_encoder.apply(target_encoder_params, jnp.zeros((1, *obs_shape)))
 
     # Helper for creating optimizers with clipping
     def make_tx(lr):
@@ -641,8 +719,7 @@ def init_agent_state_qrc_agent(
     else:
         rng, _rng = jax.random.split(rng)
         proj_online = OctaxProjection(**net_kwargs)
-        init_z = jnp.zeros((1, 7, 7, 64))  # Atari latent shape
-        proj_online_params = proj_online.init(_rng, init_z)
+        proj_online_params = proj_online.init(_rng, dummy_out)
         proj_online_state = TrainState.create(
             apply_fn=proj_online.apply,
             params=proj_online_params,
@@ -651,30 +728,30 @@ def init_agent_state_qrc_agent(
 
     rng, _rng = jax.random.split(rng)
     proj_target = OctaxProjection(**net_kwargs)
-    init_z = jnp.zeros((1, 7, 7, 64))
-    proj_target_params = proj_target.init(_rng, init_z)
+    proj_target_params = proj_target.init(_rng, dummy_out)
     proj_target_state = TrainState.create(
         apply_fn=proj_target.apply,
         params=proj_target_params,
         tx=getattr(optax, agent_config.opt)(agent_config.q_lr),
     )
 
+    # Run dummy projection to get shape for Predictor
+    dummy_proj = proj_target.apply(proj_target_params, dummy_out)
+
     # Predictor
     rng, _rng = jax.random.split(rng)
     predictor = OctaxOnlinePrediction(**net_kwargs)
-    init_z = jnp.zeros((256,))
-    predictor_params = predictor.init(_rng, init_z)
+    predictor_params = predictor.init(_rng, dummy_proj)
     predictor_state = TrainState.create(
         apply_fn=predictor.apply,
         params=predictor_params,
         tx=make_tx(agent_config.q_lr),
     )
 
-    # Transition model
+    # Transition model (operates on latent state, not projected state)
     rng, _rng = jax.random.split(rng)
     transition_model = OctaxTransitionNetwork(**net_kwargs)
-    init_z = jnp.zeros((1, 7, 7, 64))
-    transition_params = transition_model.init(_rng, init_z, jnp.int32(0))
+    transition_params = transition_model.init(_rng, dummy_out, jnp.int32(0))
     transition_state = TrainState.create(
         apply_fn=transition_model.apply,
         params=transition_params,
@@ -687,8 +764,7 @@ def init_agent_state_qrc_agent(
         )
 
     total_params = (
-        params_sum(train_states[0].params)
-        + params_sum(train_states[1].params)
+        params_sum(train_state.params)
         + (params_sum(proj_online_state.params) if proj_online_state is not None else 0)
         + params_sum(proj_target_state.params)
         + params_sum(predictor_state.params)
@@ -698,7 +774,7 @@ def init_agent_state_qrc_agent(
     print(f"Total number of params: {total_params}")
 
     # Initialize orthogonal gradient momentum states (EMA of past gradients)
-    spr_momentum_online = jax.tree.map(jnp.zeros_like, train_states[0].params)
+    spr_momentum_online = jax.tree.map(jnp.zeros_like, train_state.params)
     spr_momentum_proj = (
         jax.tree.map(jnp.zeros_like, proj_online_state.params)
         if proj_online_state is not None
@@ -710,10 +786,8 @@ def init_agent_state_qrc_agent(
     return (
         AgentState(
             agent_config,
-            *train_states,
-            h_trace,
-            grad_h_trace,
-            grad_v_trace,
+            train_state,
+            target_q_state,
             target_encoder_state,
             proj_online_state,
             proj_target_state,
@@ -728,70 +802,9 @@ def init_agent_state_qrc_agent(
     )
 
 
-def update_q_trace(e_tmins1, rho_t, gamma, lamda, grad):
-    # e_{t} = rho_t*gamma*lamda*e_{t-1} + grad)
-    e_t = jax.tree.map(lambda x, y: (rho_t * gamma * lamda * x) + y, e_tmins1, grad)
-    return e_t
-
-
-def reset_trace(trace):
-    return tree.zeros(trace)
-
-
-def orthogonal_gradient_projection(grad_t, momentum_t):
-    """
-    Compute orthogonal gradient by projecting out component parallel to momentum.
-
-    ut = gt - proj_ct-1(gt)
-    where proj_ct-1(gt) = (gt · ct-1) / (ct-1 · ct-1) * ct-1
-
-    Args:
-        grad_t: Current gradient (pytree)
-        momentum_t: EMA momentum of past gradients (pytree)
-
-    Returns:
-        Orthogonal gradient (pytree)
-    """
-    # Flatten gradients for dot product computation
-    grad_flat, grad_treedef = jax.tree_util.tree_flatten(grad_t)
-    momentum_flat, _ = jax.tree_util.tree_flatten(momentum_t)
-
-    # Compute dot products: gt · ct-1 and ct-1 · ct-1
-    dot_grad_momentum = sum([jnp.sum(g * m) for g, m in zip(grad_flat, momentum_flat)])
-    dot_momentum_momentum = sum([jnp.sum(m * m) for m in momentum_flat])
-
-    # Avoid division by zero for first step or zero momentum
-    epsilon = 1e-8
-    projection_coeff = dot_grad_momentum / (dot_momentum_momentum + epsilon)
-
-    # Compute orthogonal gradient: ut = gt - projection_coeff * ct-1
-    orthogonal_grad = jax.tree.map(
-        lambda g, m: g - projection_coeff * m, grad_t, momentum_t
-    )
-
-    return orthogonal_grad
-
-
-def update_momentum(momentum_t, grad_t, beta):
-    """
-    Update EMA momentum with current gradient.
-
-    ct = β * ct-1 + (1 - β) * gt
-
-    Args:
-        momentum_t: Current momentum (pytree)
-        grad_t: Current gradient (pytree)
-        beta: Momentum factor (scalar)
-
-    Returns:
-        Updated momentum (pytree)
-    """
-    return jax.tree.map(lambda m, g: beta * m + (1.0 - beta) * g, momentum_t, grad_t)
-
-
-## Updates for QRC(λ) agent. Equations (26)-(28) in the paper
+## Updates for DQN agent
 @partial(jax.jit, static_argnames=["terminated", "truncated", "is_nongreedy"])
-def update_step_qrc_agent(
+def update_step_dqn(
     agent_state,
     transition,
     terminated,
@@ -805,10 +818,7 @@ def update_step_qrc_agent(
     config = agent_state.agent_config
     train_state = agent_state.train_state
     q_params = train_state.params
-    h_params = agent_state.h_state.params
-    h_tm1 = agent_state.h_trace
-    grad_h_trace_tm1 = agent_state.grad_h_trace
-    grad_q_trace_tm1 = agent_state.grad_q_trace
+    target_q_params = agent_state.target_q_state.params
 
     # Initialize momentum with current state
     spr_momentum_online = agent_state.spr_momentum_online
@@ -816,50 +826,29 @@ def update_step_qrc_agent(
     spr_momentum_pred = agent_state.spr_momentum_pred
     spr_momentum_trans = agent_state.spr_momentum_trans
 
-    # QRC-lambda updates
-    def get_q(params):
-        q = train_state.apply_fn(params, obs)
-        return q[action]
-
-    q_grads = jax.grad(get_q)(q_params)
-
+    # DQN Loss calculation
     def get_td_error(params):
         q = train_state.apply_fn(params, obs)
         q_taken = q[action]
-        next_q_vect = train_state.apply_fn(params, next_obs)
-        td_error = (
-            (config.gamma * jnp.max(next_q_vect, axis=-1)) * (1 - terminated)
-            + reward
-            - q_taken
-        )
-        return td_error.squeeze(), q_taken
 
-    (td_error, q_val), td_error_grad = jax.value_and_grad(get_td_error, has_aux=True)(
-        q_params
-    )
+        # Calculate target value using target network
+        next_q_vect = train_state.apply_fn(target_q_params, next_obs)
+        max_next_q = jnp.max(next_q_vect, axis=-1)
+        target = reward + config.gamma * max_next_q * (1.0 - terminated)
+        target = jax.lax.stop_gradient(target)
 
-    def get_h(params):
-        h = agent_state.h_state.apply_fn(params, obs)
-        return h[action]
+        td_error = target - q_taken
+        # Mean Squared Error
+        loss = 0.5 * (td_error**2)
 
-    h_t, h_grads = jax.value_and_grad(get_h)(h_params)
-    rho_t = 1.0
-    h_trace_t = (rho_t * config.gamma * config.lamda * h_tm1) + h_t
-    grad_h_trace_t = update_q_trace(
-        grad_h_trace_tm1, rho_t, config.gamma, config.lamda, h_grads
-    )
-    grad_q_trace_t = update_q_trace(
-        grad_q_trace_tm1, rho_t, config.gamma, config.lamda, q_grads
-    )
+        return loss, (td_error, q_taken)
 
-    # QRC Q-network update
-    q_update = tree.scale(-h_trace_t, td_error_grad)
-    if config.gradient_correction:
-        q_update = tree.add(
-            tree.scale(td_error, grad_q_trace_t),
-            tree.scale(-h_t, q_grads),
-            q_update,
-        )
+    # We need gradients of loss w.r.t q_params
+    (q_loss_val, (td_error, q_val)), q_grads = jax.value_and_grad(
+        get_td_error, has_aux=True
+    )(q_params)
+
+    q_update = q_grads
 
     # SPR loss computation
     spr_loss = 0.0
@@ -1010,52 +999,30 @@ def update_step_qrc_agent(
             skip_spr,
         )
 
-        # Apply orthogonal gradient projection
-        spr_grads_online = orthogonal_gradient_projection(
-            spr_grads_online, spr_momentum_online
-        )
-        if not config.shared_online_proj:
-            spr_grads_proj = orthogonal_gradient_projection(
-                spr_grads_proj, spr_momentum_proj
-            )
-        spr_grads_pred = orthogonal_gradient_projection(
-            spr_grads_pred, spr_momentum_pred
-        )
-        spr_grads_trans = orthogonal_gradient_projection(
-            spr_grads_trans, spr_momentum_trans
-        )
+        # Apply orthogonal gradient projection if enabled
+        if config.use_orth:
+            spr_grads_online = orthogonal_gradient_projection(spr_grads_online, spr_momentum_online)
+            if not config.shared_online_proj:
+                spr_grads_proj = orthogonal_gradient_projection(spr_grads_proj, spr_momentum_proj)
+            spr_grads_pred = orthogonal_gradient_projection(spr_grads_pred, spr_momentum_pred)
+            spr_grads_trans = orthogonal_gradient_projection(spr_grads_trans, spr_momentum_trans)
 
-        # Update momentum
-        spr_momentum_online = update_momentum(
-            spr_momentum_online, spr_grads_online, config.orth_beta
-        )
-        if not config.shared_online_proj:
-            spr_momentum_proj = update_momentum(spr_momentum_proj, spr_grads_proj, config.orth_beta)
-        spr_momentum_pred = update_momentum(spr_momentum_pred, spr_grads_pred, config.orth_beta)
-        spr_momentum_trans = update_momentum(spr_momentum_trans, spr_grads_trans, config.orth_beta)
+            spr_momentum_online = update_momentum(spr_momentum_online, spr_grads_online, config.orth_beta)
+            if not config.shared_online_proj:
+                spr_momentum_proj = update_momentum(spr_momentum_proj, spr_grads_proj, config.orth_beta)
+            spr_momentum_pred = update_momentum(spr_momentum_pred, spr_grads_pred, config.orth_beta)
+            spr_momentum_trans = update_momentum(spr_momentum_trans, spr_grads_trans, config.orth_beta)
 
-        # Combine QRC and SPR gradients
+        # Combine DQN and SPR gradients
         q_update = jax.tree.map(
-            lambda qrc_g, spr_g: qrc_g + config.spr_weight * spr_g,
+            lambda q_g, spr_g: q_g + config.spr_weight * spr_g,
             q_update,
             spr_grads_online,
         )
 
-    q_train_state = train_state.apply_gradients(grads=tree.neg(q_update))
-
-    # Update H-network
-    delta_z_h = tree.scale(td_error, grad_h_trace_t)
-    h_h_grad = tree.scale(-h_t, h_grads)
-    beta_params = tree.scale(-config.reg_coeff, h_params)
-
-    h_update = jax.tree.map(
-        lambda x, y, z: -(x + y + z), delta_z_h, h_h_grad, beta_params
-    )
-
-    h_train_state = agent_state.h_state.apply_gradients(grads=h_update)
+    q_train_state = train_state.apply_gradients(grads=q_update)
 
     # Update SPR components
-
     if agent_state.proj_online_state is not None:
         proj_online_state = agent_state.proj_online_state.apply_gradients(
             grads=tree.scale(config.spr_weight, spr_grads_proj)
@@ -1071,6 +1038,8 @@ def update_step_qrc_agent(
     )
 
     # EMA update for target networks
+
+    # 1. SPR Target Encoder
     target_params = ema_update(
         agent_state.target_encoder_state.params["params"]["target_encoder"],
         q_train_state.params["params"]["online_encoder"],
@@ -1080,6 +1049,7 @@ def update_step_qrc_agent(
         params={"params": {"target_encoder": target_params}}
     )
 
+    # 2. SPR Projection Target
     proj_target_params = ema_update(
         agent_state.proj_target_state.params["params"]["proj"],
         (
@@ -1093,21 +1063,21 @@ def update_step_qrc_agent(
         params={"params": {"proj": proj_target_params}}
     )
 
-    if terminated or truncated or is_nongreedy:
-        h_trace_t = reset_trace(h_trace_t)
-        grad_h_trace_t = reset_trace(grad_h_trace_t)
-        grad_q_trace_t = reset_trace(grad_q_trace_t)
+    # 3. DQN Target Network update
+    target_q_params = ema_update(
+        agent_state.target_q_state.params,
+        q_train_state.params,
+        config.dqn_tau,
+    )
+    target_q_state = agent_state.target_q_state.replace(params=target_q_params)
 
     # Calculate L2 norms for logging
     q_update_l2 = optax.global_norm(q_update)
-    h_update_l2 = optax.global_norm(h_update)
 
     metrics = {
         "td_error": td_error,
         "q_val": q_val,
-        "h_val": h_t,
         "q_update_l2": q_update_l2,
-        "h_update_l2": h_update_l2,
         "spr_loss": spr_loss,
         "mse_loss": mse_loss,
         "y_magnitude": y_mag,
@@ -1117,10 +1087,7 @@ def update_step_qrc_agent(
         AgentState(
             config,
             q_train_state,
-            h_train_state,
-            h_trace_t,
-            grad_h_trace_t,
-            grad_q_trace_t,
+            target_q_state,
             target_encoder_state,
             proj_online_state,
             proj_target_state,
@@ -1135,7 +1102,7 @@ def update_step_qrc_agent(
     )
 
 
-QRCAgent = Agent(init_agent_state_qrc_agent, agent_step, update_step_qrc_agent)
+QRCAgent = Agent(init_agent_state_dqn, agent_step, update_step_dqn)
 
 
 ###################################################################################
@@ -1163,7 +1130,8 @@ def experiment(args: Args, agent: Agent, run_name: str):
     env = make_env(args, 0, run_name)()
     obs, _ = env.reset(seed=args.seed)
     obs = np.array(obs)
-    if obs.shape == (4, 84, 84):
+    # Handle observation transposing for atari (C, H, W) -> (H, W, C)
+    if args.env_type == "atari" and obs.shape == (4, 84, 84):
         obs = obs.transpose(1, 2, 0)
     episodes = 0
     episode_return = 0.0
@@ -1187,9 +1155,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
     loss_accum = {
         "td_error": 0.0,
         "q_val": 0.0,
-        "h_val": 0.0,
         "q_update_l2": 0.0,
-        "h_update_l2": 0.0,
         "spr_loss": 0.0,
         "mse_loss": 0.0,
         "y_magnitude": 0.0,
@@ -1242,18 +1208,8 @@ def experiment(args: Args, agent: Agent, run_name: str):
             new_train_state = restore_train_state(
                 agent_state.train_state, checkpoint_data["train_state"]
             )
-            new_h_state = restore_train_state(
-                agent_state.h_state, checkpoint_data.get("h_state")
-            )
-
-            h_trace = flax.serialization.from_bytes(
-                agent_state.h_trace, checkpoint_data["h_trace"]
-            )
-            grad_h_trace = flax.serialization.from_bytes(
-                agent_state.grad_h_trace, checkpoint_data["grad_h_trace"]
-            )
-            grad_q_trace = flax.serialization.from_bytes(
-                agent_state.grad_q_trace, checkpoint_data["grad_q_trace"]
+            new_target_q_state = restore_train_state(
+                agent_state.target_q_state, checkpoint_data["target_q_state"]
             )
 
             new_target_encoder_state = restore_train_state(
@@ -1278,23 +1234,27 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 checkpoint_data.get("spr_momentum_online"),
             )
             new_spr_momentum_proj = restore_momentum(
-                agent_state.spr_momentum_proj, checkpoint_data.get("spr_momentum_proj")
+                agent_state.spr_momentum_proj,
+                checkpoint_data.get("spr_momentum_proj"),
             )
             new_spr_momentum_pred = restore_momentum(
-                agent_state.spr_momentum_pred, checkpoint_data.get("spr_momentum_pred")
+                agent_state.spr_momentum_pred,
+                checkpoint_data.get("spr_momentum_pred"),
             )
             new_spr_momentum_trans = restore_momentum(
                 agent_state.spr_momentum_trans,
                 checkpoint_data.get("spr_momentum_trans"),
             )
 
+            if "traj_buffer" in checkpoint_data:
+                traj_buffer = flax.serialization.from_bytes(
+                    traj_buffer, checkpoint_data["traj_buffer"]
+                )
+
             agent_state = AgentState(
                 agent_config=agent_state.agent_config,
                 train_state=new_train_state,
-                h_state=new_h_state,
-                h_trace=h_trace,
-                grad_h_trace=grad_h_trace,
-                grad_q_trace=grad_q_trace,
+                target_q_state=new_target_q_state,
                 target_encoder_state=new_target_encoder_state,
                 proj_online_state=new_proj_online_state,
                 proj_target_state=new_proj_target_state,
@@ -1305,11 +1265,6 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 spr_momentum_pred=new_spr_momentum_pred,
                 spr_momentum_trans=new_spr_momentum_trans,
             )
-
-            if "traj_buffer" in checkpoint_data:
-                traj_buffer = flax.serialization.from_bytes(
-                    traj_buffer, checkpoint_data["traj_buffer"]
-                )
 
             start_step = checkpoint_data["step"] + 1
             rng = checkpoint_data["rng"]
@@ -1329,9 +1284,10 @@ def experiment(args: Args, agent: Agent, run_name: str):
         traj_buffer = traj_buffer.add(obs, action)
 
         next_obs, reward, terminated, truncated, info = env.step(action)
-        next_obs = np.array(next_obs).transpose(
-            1, 2, 0
-        )  # Convert LazyFrames to numpy array and transpose
+        next_obs = np.array(next_obs)
+        # Handle observation transposing for atari (C, H, W) -> (H, W, C)
+        if args.env_type == "atari" and next_obs.shape == (4, 84, 84):
+            next_obs = next_obs.transpose(1, 2, 0)
         done = terminated or truncated
 
         episode_return += reward
@@ -1375,7 +1331,8 @@ def experiment(args: Args, agent: Agent, run_name: str):
 
             next_obs, info = env.reset()
             next_obs = np.array(next_obs)
-            if next_obs.shape == (4, 84, 84):
+            # Handle observation transposing for atari (C, H, W) -> (H, W, C)
+            if args.env_type == "atari" and next_obs.shape == (4, 84, 84):
                 next_obs = next_obs.transpose(1, 2, 0)
 
         # Check if training is complete (moved outside the if done block)
@@ -1409,9 +1366,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 "avg_length": avg_length,
                 "td_loss": avg_losses["td_error"],
                 "q_values": avg_losses["q_val"],
-                "h_values": avg_losses["h_val"],
                 "q_update_l2": avg_losses["q_update_l2"],
-                "h_update_l2": avg_losses["h_update_l2"],
                 "SPS": sps,
                 "epsilon": epsilon,
                 "episodes": episodes,
@@ -1429,9 +1384,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
                     "charts/epsilon": epsilon,
                     "losses/td_loss": log_dict["td_loss"],
                     "losses/q_values": log_dict["q_values"],
-                    "losses/h_values": log_dict["h_values"],
                     "updates/q_update_l2": log_dict["q_update_l2"],
-                    "updates/h_update_l2": log_dict["h_update_l2"],
                     "episodes": episodes,
                     "losses/spr_loss": log_dict["spr_loss"],
                     "losses/mse_loss": log_dict["mse_loss"],
@@ -1467,10 +1420,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
             checkpoint_data = {
                 "step": t,
                 "train_state": save_train_state(agent_state.train_state),
-                "h_state": save_train_state(agent_state.h_state),
-                "h_trace": flax.serialization.to_bytes(agent_state.h_trace),
-                "grad_h_trace": flax.serialization.to_bytes(agent_state.grad_h_trace),
-                "grad_q_trace": flax.serialization.to_bytes(agent_state.grad_q_trace),
+                "target_q_state": save_train_state(agent_state.target_q_state),
                 "target_encoder_state": save_train_state(
                     agent_state.target_encoder_state
                 ),
@@ -1507,7 +1457,10 @@ def experiment(args: Args, agent: Agent, run_name: str):
             with open(model_path, "wb") as f:
                 f.write(
                     flax.serialization.to_bytes(
-                        [agent_state.train_state.params, agent_state.h_state.params]
+                        [
+                            agent_state.train_state.params,
+                            agent_state.target_q_state.params,
+                        ]
                     )
                 )
             print(f"Checkpoint saved to {model_path}")
@@ -1520,7 +1473,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
         with open(model_path, "wb") as f:
             f.write(
                 flax.serialization.to_bytes(
-                    [agent_state.train_state.params, agent_state.h_state.params]
+                    [agent_state.train_state.params, agent_state.target_q_state.params]
                 )
             )
         print(f"Final model saved to {model_path}")

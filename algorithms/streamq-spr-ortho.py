@@ -145,6 +145,10 @@ class Args:
     """whether to use data augmentation for SPR"""
     orthogonalize_shared_encoder: bool = True
     """project SPR encoder updates orthogonal to RL updates"""
+    use_ema_obgd_orth: bool = False
+    """project SPR encoder against EMA of ObGD updates instead of single-step"""
+    orth_beta: float = 0.99
+    """EMA momentum factor for orthogonal gradient projections"""
 
     max_grad: float = 100.0
     """maximum gradient norm for clipping"""
@@ -608,6 +612,7 @@ class AgentState(NamedTuple):
     spr_momentum_proj: Optional[any]  # momentum for projection head
     spr_momentum_pred: Optional[any]  # momentum for predictor
     spr_momentum_trans: Optional[any]  # momentum for transition model
+    obgd_momentum: Optional[any]  # EMA of ObGD RL encoder updates (for A6 ablation)
 
 
 @partial(jax.jit, static_argnames=["action_dim"])
@@ -744,6 +749,7 @@ def init_agent_state_streamq(
     spr_momentum_proj = None
     spr_momentum_pred = None
     spr_momentum_trans = None
+    obgd_momentum = None
 
     if agent_config.use_spr:
         # Helper for creating optimizers
@@ -818,6 +824,10 @@ def init_agent_state_streamq(
         )
         spr_momentum_trans = jax.tree.map(jnp.zeros_like, transition_params)
 
+        # For A6 ablation: EMA of ObGD encoder updates
+        if "params" in params and "online_encoder" in params["params"]:
+            obgd_momentum = jax.tree.map(jnp.zeros_like, params["params"]["online_encoder"])
+
         print("SPR Components Initialized")
 
     return (
@@ -833,6 +843,7 @@ def init_agent_state_streamq(
             spr_momentum_proj,
             spr_momentum_pred,
             spr_momentum_trans,
+            obgd_momentum,
         ),
         rng,
     )
@@ -897,6 +908,7 @@ def update_step_streamq(
     spr_momentum_proj = agent_state.spr_momentum_proj
     spr_momentum_pred = agent_state.spr_momentum_pred
     spr_momentum_trans = agent_state.spr_momentum_trans
+    obgd_momentum = agent_state.obgd_momentum
 
     if config.use_spr and traj_buffer is not None and rng is not None:
         spr_obs = traj_buffer.observations
@@ -1003,28 +1015,32 @@ def update_step_streamq(
                 grads_online, spr_momentum_online
             )
             spr_momentum_online = update_momentum(
-                spr_momentum_online, grads_online, 0.99
+                spr_momentum_online, grads_online, config.orth_beta
             )
 
         # Apply orthogonal gradient projection for auxiliary heads
         # 1. Projection head
         if not config.shared_online_proj and proj_online_state:
             grads_proj = orthogonal_gradient_projection(grads_proj, spr_momentum_proj)
-            spr_momentum_proj = update_momentum(spr_momentum_proj, grads_proj, 0.99)
+            spr_momentum_proj = update_momentum(spr_momentum_proj, grads_proj, config.orth_beta)
 
         # 2. Predictor
         grads_pred = orthogonal_gradient_projection(grads_pred, spr_momentum_pred)
-        spr_momentum_pred = update_momentum(spr_momentum_pred, grads_pred, 0.99)
+        spr_momentum_pred = update_momentum(spr_momentum_pred, grads_pred, config.orth_beta)
 
         # 3. Transition
         grads_trans = orthogonal_gradient_projection(grads_trans, spr_momentum_trans)
-        spr_momentum_trans = update_momentum(spr_momentum_trans, grads_trans, 0.99)
+        spr_momentum_trans = update_momentum(spr_momentum_trans, grads_trans, config.orth_beta)
 
         # Apply Updates
         # 1. Online Encoder (shared) - add to params with orthogonalization
         spr_update_vec = jax.tree.map(
             lambda g: -config.q_lr * config.spr_weight * g, grads_online
         )
+
+        # Update ObGD momentum with current RL encoder update
+        if config.use_ema_obgd_orth and rl_encoder_update is not None and obgd_momentum is not None:
+            obgd_momentum = update_momentum(obgd_momentum, rl_encoder_update, config.orth_beta)
 
         if (
             config.orthogonalize_shared_encoder
@@ -1033,10 +1049,12 @@ def update_step_streamq(
             and "online_encoder" in spr_update_vec["params"]
         ):
             spr_encoder_update = spr_update_vec["params"]["online_encoder"]
+            # Use EMA of ObGD updates or single-step based on flag
+            reference = obgd_momentum if (config.use_ema_obgd_orth and obgd_momentum is not None) else rl_encoder_update
             (
                 orth_update,
                 encoder_update_cos,
-            ) = orthogonal_component_against(spr_encoder_update, rl_encoder_update)
+            ) = orthogonal_component_against(spr_encoder_update, reference)
             if isinstance(spr_update_vec, frozen_dict.FrozenDict):
                 spr_update_mut = frozen_dict.unfreeze(spr_update_vec)
             else:
@@ -1119,6 +1137,7 @@ def update_step_streamq(
             spr_momentum_proj,
             spr_momentum_pred,
             spr_momentum_trans,
+            obgd_momentum,
         ),
         metrics,
     )
@@ -1248,6 +1267,10 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 agent_state.spr_momentum_trans,
                 checkpoint_data.get("spr_momentum_trans"),
             )
+            new_obgd_momentum = restore_momentum(
+                agent_state.obgd_momentum,
+                checkpoint_data.get("obgd_momentum"),
+            )
 
             agent_state = AgentState(
                 agent_config=agent_state.agent_config,
@@ -1261,6 +1284,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 spr_momentum_proj=new_spr_momentum_proj,
                 spr_momentum_pred=new_spr_momentum_pred,
                 spr_momentum_trans=new_spr_momentum_trans,
+                obgd_momentum=new_obgd_momentum,
             )
 
             if "traj_buffer" in checkpoint_data:
@@ -1411,6 +1435,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 "spr_momentum_proj": save_momentum(agent_state.spr_momentum_proj),
                 "spr_momentum_pred": save_momentum(agent_state.spr_momentum_pred),
                 "spr_momentum_trans": save_momentum(agent_state.spr_momentum_trans),
+                "obgd_momentum": save_momentum(agent_state.obgd_momentum),
                 "traj_buffer": flax.serialization.to_bytes(traj_buffer),
                 "rng": rng,
                 "episodes": episodes,

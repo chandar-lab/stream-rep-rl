@@ -18,3 +18,5 @@ outputs/
 *.tmp.json
 *.png
 *.tex
+docs/
+CLAUDE.md

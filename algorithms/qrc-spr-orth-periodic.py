@@ -137,6 +137,9 @@ class Args:
     orth_beta: float = 0.99
     """EMA momentum factor for orthogonal gradient projection"""
 
+    spr_update_freq: int = 1
+    """how often to compute and apply SPR updates (every N steps)"""
+
     max_grad: float = 100.0
     """maximum gradient norm for clipping"""
 
@@ -789,7 +792,7 @@ def update_momentum(momentum_t, grad_t, beta):
     return jax.tree.map(lambda m, g: beta * m + (1.0 - beta) * g, momentum_t, grad_t)
 
 
-## Updates for QRC(λ) agent. Equations (26)-(28) in the paper
+## Updates for QRC(λ) agent with periodic SPR updates.
 @partial(jax.jit, static_argnames=["terminated", "truncated", "is_nongreedy"])
 def update_step_qrc_agent(
     agent_state,
@@ -799,6 +802,7 @@ def update_step_qrc_agent(
     is_nongreedy,
     traj_buffer=None,
     rng=None,
+    global_step=0,
 ):
     obs, action, next_obs, reward = transition
 
@@ -996,6 +1000,9 @@ def update_step_qrc_agent(
                 spr_grads_trans,
             )
 
+        # Gate SPR computation on periodic schedule
+        spr_should_fire = jnp.bool_(global_step % config.spr_update_freq == 0)
+
         (
             spr_loss,
             mse_loss,
@@ -1005,7 +1012,7 @@ def update_step_qrc_agent(
             spr_grads_pred,
             spr_grads_trans,
         ) = jax.lax.cond(
-            traj_buffer.is_full() & (~terminated) & (~truncated) & (~is_nongreedy),
+            traj_buffer.is_full() & (~terminated) & (~truncated) & (~is_nongreedy) & spr_should_fire,
             compute_spr,
             skip_spr,
         )
@@ -1358,6 +1365,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
             is_nongreedy,
             traj_buffer,
             rng_update,
+            global_step=t,
         )
 
         # Accumulate losses

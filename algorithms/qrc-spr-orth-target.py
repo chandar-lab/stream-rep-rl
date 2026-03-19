@@ -137,6 +137,9 @@ class Args:
     orth_beta: float = 0.99
     """EMA momentum factor for orthogonal gradient projection"""
 
+    target_network_frequency: int = 1000
+    """how often to hard-copy params to target network (steps)"""
+
     max_grad: float = 100.0
     """maximum gradient norm for clipping"""
 
@@ -535,6 +538,8 @@ class AgentState(NamedTuple):
     spr_momentum_proj: Optional[jnp.ndarray]  # None if shared_online_proj is True
     spr_momentum_pred: Optional[jnp.ndarray]
     spr_momentum_trans: Optional[jnp.ndarray]
+    # Target network params for TD targets
+    target_params: Optional[jnp.ndarray]
 
 
 @partial(jax.jit, static_argnames=["action_dim"])
@@ -617,6 +622,9 @@ def init_agent_state_qrc_agent(
     grad_h_trace = jax.tree.map(jnp.zeros_like, train_states[1].params)
     grad_v_trace = jax.tree.map(jnp.zeros_like, train_states[0].params)
     h_trace = 0.0
+
+    # Initialize target params for TD targets (hard copy of Q-network params)
+    target_params = jax.tree.map(jnp.copy, train_states[0].params)
 
     # Target encoder
     target_encoder = OctaxTargetEncoder(**net_kwargs)
@@ -723,6 +731,7 @@ def init_agent_state_qrc_agent(
             spr_momentum_proj,
             spr_momentum_pred,
             spr_momentum_trans,
+            target_params,
         ),
         rng,
     )
@@ -816,6 +825,9 @@ def update_step_qrc_agent(
     spr_momentum_pred = agent_state.spr_momentum_pred
     spr_momentum_trans = agent_state.spr_momentum_trans
 
+    # Target params for TD target computation (not differentiated through)
+    target_params = agent_state.target_params
+
     # QRC-lambda updates
     def get_q(params):
         q = train_state.apply_fn(params, obs)
@@ -826,7 +838,8 @@ def update_step_qrc_agent(
     def get_td_error(params):
         q = train_state.apply_fn(params, obs)
         q_taken = q[action]
-        next_q_vect = train_state.apply_fn(params, next_obs)
+        # Use target_params for next state Q-values (not differentiated through)
+        next_q_vect = train_state.apply_fn(target_params, next_obs)
         td_error = (
             (config.gamma * jnp.max(next_q_vect, axis=-1)) * (1 - terminated)
             + reward
@@ -1071,13 +1084,13 @@ def update_step_qrc_agent(
     )
 
     # EMA update for target networks
-    target_params = ema_update(
+    target_enc_params = ema_update(
         agent_state.target_encoder_state.params["params"]["target_encoder"],
         q_train_state.params["params"]["online_encoder"],
         config.spr_tau,
     )
     target_encoder_state = agent_state.target_encoder_state.replace(
-        params={"params": {"target_encoder": target_params}}
+        params={"params": {"target_encoder": target_enc_params}}
     )
 
     proj_target_params = ema_update(
@@ -1130,6 +1143,7 @@ def update_step_qrc_agent(
             spr_momentum_proj,
             spr_momentum_pred,
             spr_momentum_trans,
+            agent_state.target_params,  # target_params unchanged here; synced in training loop
         ),
         metrics,
     )
@@ -1288,6 +1302,12 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 checkpoint_data.get("spr_momentum_trans"),
             )
 
+            # Restore target_params for TD targets
+            new_target_params = restore_momentum(
+                agent_state.target_params,
+                checkpoint_data.get("target_params"),
+            )
+
             agent_state = AgentState(
                 agent_config=agent_state.agent_config,
                 train_state=new_train_state,
@@ -1304,6 +1324,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 spr_momentum_proj=new_spr_momentum_proj,
                 spr_momentum_pred=new_spr_momentum_pred,
                 spr_momentum_trans=new_spr_momentum_trans,
+                target_params=new_target_params,
             )
 
             if "traj_buffer" in checkpoint_data:
@@ -1359,6 +1380,12 @@ def experiment(args: Args, agent: Agent, run_name: str):
             traj_buffer,
             rng_update,
         )
+
+        # Periodic target network sync
+        if t % args.target_network_frequency == 0:
+            agent_state = agent_state._replace(
+                target_params=jax.tree.map(jnp.copy, agent_state.train_state.params)
+            )
 
         # Accumulate losses
         for k in loss_accum:
@@ -1482,6 +1509,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 "spr_momentum_proj": save_momentum(agent_state.spr_momentum_proj),
                 "spr_momentum_pred": save_momentum(agent_state.spr_momentum_pred),
                 "spr_momentum_trans": save_momentum(agent_state.spr_momentum_trans),
+                "target_params": save_momentum(agent_state.target_params),
                 "traj_buffer": flax.serialization.to_bytes(traj_buffer),
                 "rng": rng,
                 "episodes": episodes,
