@@ -22,9 +22,9 @@ fi
 EXP_CLASS="rebuttal-A6"
 
 # MinAtar runs disabled
-# launch_runs_minatar "streamq-spr-ortho.py" MINATAR_5 \
-#     --exp_class "$EXP_CLASS" \
-#     --use_ema_obgd_orth
+launch_runs_minatar "streamq-spr-ortho.py" MINATAR_5 \
+    --exp_class "$EXP_CLASS" \
+    --use_ema_obgd_orth
 
 wait
 echo "A6: All experiments completed."

@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from gtd_algos.src import tree
+from utils import tree
 
 
 def obgd_with_traces(lr, gamma, lambd, kappa):

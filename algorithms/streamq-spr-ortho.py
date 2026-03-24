@@ -1118,11 +1118,31 @@ def update_step_streamq(
         opt_state=opt_state,
     )
 
+    # Compute ObGD effective learning rate for diagnostic logging
+    delta_bar = jnp.maximum(jnp.abs(td_error), 1.0)
+    z_l1 = tree.l1_norm(opt_state)
+    obgd_M = config.q_lr * config.kappa * delta_bar * z_l1
+    obgd_effective_lr = config.q_lr / jnp.maximum(obgd_M, 1.0)
+    spr_effective_lr = config.q_lr * config.spr_weight
+
+    # Encoder gradient norms
+    rl_enc_norm = (
+        tree.l2_norm(rl_encoder_update)
+        if rl_encoder_update is not None
+        else jnp.array(0.0)
+    )
+
     metrics = {
         "td_error": td_error,
         "q_val": q_taken,
         "spr_loss": spr_loss,
         "encoder_update_cos": encoder_update_cos,
+        "obgd_effective_lr": obgd_effective_lr,
+        "spr_effective_lr": spr_effective_lr,
+        "lr_ratio": obgd_effective_lr / (spr_effective_lr + 1e-12),
+        "rl_encoder_grad_norm": rl_enc_norm,
+        "obgd_delta_bar": delta_bar,
+        "obgd_z_l1": z_l1,
     }
     return (
         AgentState(
@@ -1376,6 +1396,11 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 "q_values": float(metrics["q_val"]),
                 "spr_loss": float(metrics.get("spr_loss", 0.0)),
                 "encoder_update_cos": float(metrics.get("encoder_update_cos", 0.0)),
+                "obgd_effective_lr": float(metrics.get("obgd_effective_lr", 0.0)),
+                "spr_effective_lr": float(metrics.get("spr_effective_lr", 0.0)),
+                "lr_ratio": float(metrics.get("lr_ratio", 0.0)),
+                "rl_encoder_grad_norm": float(metrics.get("rl_encoder_grad_norm", 0.0)),
+                "obgd_delta_bar": float(metrics.get("obgd_delta_bar", 0.0)),
                 "SPS": sps,
                 "epsilon": epsilon,
                 "episodes": episodes,
@@ -1392,6 +1417,11 @@ def experiment(args: Args, agent: Agent, run_name: str):
                     "losses/q_values": log_dict["q_values"],
                     "losses/spr_loss": log_dict["spr_loss"],
                     "debug/encoder_cos": log_dict["encoder_update_cos"],
+                    "debug/obgd_effective_lr": log_dict["obgd_effective_lr"],
+                    "debug/spr_effective_lr": log_dict["spr_effective_lr"],
+                    "debug/lr_ratio": log_dict["lr_ratio"],
+                    "debug/rl_encoder_grad_norm": log_dict["rl_encoder_grad_norm"],
+                    "debug/obgd_delta_bar": log_dict["obgd_delta_bar"],
                     "episodes": episodes,
                 },
                 step=t,

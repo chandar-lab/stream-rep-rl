@@ -21,7 +21,8 @@ fi
 
 export WANDB_DIR="$WANDB_LOG_DIR"
 export WANDB_ENTITY=""
-export WANDB_PROJECT="stream-rl-ablations"
+export WANDB_PROJECT="stream-rl-rebuttal"
+export WANDB_MODE=offline
 
 if [ $? -ne 0 ]; then
     echo "Module loading failed. Exiting."
@@ -111,6 +112,7 @@ launch_runs_minatar() {
                 --seed "$SEED" \
                 --track \
                 --resume \
+                --log_dir "$CHECKPOINT_DIR" \
                 --total_timesteps 5000000 \
                 $extra_args &
         done

@@ -20,3 +20,7 @@ outputs/
 *.tex
 docs/
 CLAUDE.md
+atari-data/
+octax-data/
+minatar-data/
+atari-data-200M/

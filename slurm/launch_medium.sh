@@ -14,8 +14,8 @@ for FREQ in 1 5 10 20; do
     echo "  Submitted A5: Periodic SPR (freq=$FREQ)"
 done
 
-# sbatch A6_ema_obgd.sh
-# echo "  Submitted A6: EMA ObGD orth"
+sbatch A6_ema_obgd.sh
+echo "  Submitted A6: EMA ObGD orth"
 
 sbatch A7_plasticity.sh
 echo "  Submitted A7: Plasticity baseline"

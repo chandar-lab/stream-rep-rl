@@ -8,6 +8,7 @@ from typing import Callable, NamedTuple, Optional, List
 from dataclasses import dataclass
 import gymnasium as gym
 import itertools
+from utils import normalization
 import wandb
 from functools import partial
 import jax
@@ -20,8 +21,10 @@ import os
 import pickle
 from flax.training.train_state import TrainState
 from flax import struct
+from flax.core import frozen_dict
 import csv
 import flax
+import flax.linen as nn
 
 from utils import tree
 from networks.MLP import sparse_init
@@ -32,6 +35,7 @@ from networks.value_networks import (
     OctaxProjection,
     OctaxOnlinePrediction,
 )
+from utils.optimizers import sgd_with_traces, obgd_with_traces
 from utils.atari_wrappers import (
     ClipRewardEnv,
     EpisodicLifeEnv,
@@ -39,7 +43,6 @@ from utils.atari_wrappers import (
     MaxAndSkipEnv,
     NoopResetEnv,
 )
-
 from utils.store_episode_returns_and_lengths import (
     StoreEpisodeReturnsAndLengths,
 )
@@ -77,6 +80,7 @@ class Args:
     log_dir: str = "logs"
     """the logging directory"""
     env_type: str = "octax"
+    """the type of environment"""
 
     # Algorithm specific arguments
     env_id: str = "filter"
@@ -85,13 +89,19 @@ class Args:
     """total timesteps of the experiments"""
     q_lr: float = 1e-4
     """the learning rate of the Q-network optimizer"""
+    kappa: float = 2.0
+    """kappa for OBGD optimizer"""
+    alpha_sc: float = 1.0
+    """alpha scaling - not used in current code but good to have"""
+    zeta: float = 1.0
+    """zeta parameter - not used in current code but good to have"""
     gamma: float = 0.99
     """the discount factor gamma"""
     start_epsilon: float = 1.0
     """the starting epsilon for exploration"""
     end_epsilon: float = 0.01
     """the ending epsilon for exploration"""
-    explore_frac: float = 0.10
+    explore_frac: float = 0.20
     """the fraction of total-timesteps for epsilon annealing"""
     h_lr_scale: float = 0.1
     """scale for auxiliary network learning rate"""
@@ -107,7 +117,7 @@ class Args:
     """the activation function to use in the networks"""
     gradient_correction: bool = True
     """whether to use gradient correction (TDC vs GTD2)"""
-    opt: str = "sgd"
+    opt: str = "obgd"
     """optimizer to use"""
     net_arch: str = "minatar"
     """network architecture"""
@@ -129,13 +139,16 @@ class Args:
     """lambda - weight for SPR loss"""
     spr_tau: float = 0.99
     """EMA coefficient for target network (0.0 to disable)"""
-    shared_online_proj: bool = True
+    shared_online_proj: bool = False
     """whether to share projection head between Q-network and SPR"""
     use_augmentation: bool = False
     """whether to use data augmentation for SPR"""
-
+    orthogonalize_shared_encoder: bool = True
+    """project SPR encoder updates orthogonal to RL updates"""
+    use_ema_obgd_orth: bool = False
+    """project SPR encoder against EMA of ObGD updates instead of single-step"""
     orth_beta: float = 0.99
-    """EMA momentum factor for orthogonal gradient projection"""
+    """EMA momentum factor for orthogonal gradient projections"""
 
     max_grad: float = 100.0
     """maximum gradient norm for clipping"""
@@ -190,79 +203,58 @@ class OctaxToGymAdapter(gym.Env):
 
 def make_env(args, idx, run_name):
     if args.env_type == "atari":
+        if args.capture_video and idx == 0:
+            env = gym.make(args.env_id, render_mode="rgb_array")
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        else:
+            env = gym.make(args.env_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
 
-        def thunk():
-            if args.capture_video and idx == 0:
-                env = gym.make(args.env_id, render_mode="rgb_array")
-                env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-            else:
-                env = gym.make(args.env_id)
-            env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = NoopResetEnv(env, noop_max=30)
+        env = MaxAndSkipEnv(env, skip=4)
+        env = EpisodicLifeEnv(env)
+        if "FIRE" in env.unwrapped.get_action_meanings():
+            env = FireResetEnv(env)
+        env = ClipRewardEnv(env)
+        env = gym.wrappers.ResizeObservation(env, (84, 84))
+        env = gym.wrappers.GrayScaleObservation(env)
+        env = gym.wrappers.FrameStack(env, 4)
 
-            env = NoopResetEnv(env, noop_max=30)
-            env = MaxAndSkipEnv(env, skip=4)
-            env = EpisodicLifeEnv(env)
-            if "FIRE" in env.unwrapped.get_action_meanings():
-                env = FireResetEnv(env)
-            env = ClipRewardEnv(env)
-            env = gym.wrappers.ResizeObservation(env, (84, 84))
-            env = gym.wrappers.GrayScaleObservation(env)
-            env = gym.wrappers.FrameStack(env, 4)
+        env = RecordEpisodeStatisticsJAX(env)
+        # env = StoreEpisodeReturnsAndLengthsJAX(env)
 
-            env = RecordEpisodeStatisticsJAX(env)
-            # env = StoreEpisodeReturnsAndLengthsJAX(env)
+        # Normalization must come after stats for correct results
+        # if env_config.normalize_reward:
+        env = ScaleRewardJAX(env, gamma=args.gamma)
+        # if env_config.normalize_obs:
+        env = NormalizeObservationJAX(env)
 
-            # Normalization must come after stats for correct results
-            # if env_config.normalize_reward:
-            env = ScaleRewardJAX(env, gamma=args.gamma)
-            # if env_config.normalize_obs:
-            env = NormalizeObservationJAX(env)
-
-            env.action_space.seed(args.seed)
-            return env
-
-        return thunk
+        env.action_space.seed(args.seed)
+        return env
 
     elif args.env_type == "octax":
+        print(f"Creating Octax environment: {args.env_id}")
+        env = OctaxToGymAdapter(args.env_id, seed=args.seed)
 
-        def thunk():
-            print(f"Creating Octax environment: {args.env_id}")
-            env = OctaxToGymAdapter(args.env_id, seed=args.seed)
+        env = RecordEpisodeStatisticsJAX(env)
+        env = ScaleRewardJAX(env, gamma=args.gamma)
+        env = NormalizeObservationJAX(env)
 
-            env = RecordEpisodeStatisticsJAX(env)
-            env = ScaleRewardJAX(env, gamma=args.gamma)
-            env = NormalizeObservationJAX(env)
-
-            return env
-
-        return thunk
+        return env
 
     elif args.env_type == "minatar":
+        print(f"Creating standard Gym Minatar environment: {args.env_id}")
+        env = gym.make(args.env_id)
 
-        def thunk():
-            print(f"Creating standard Gym Minatar environment: {args.env_id}")
-            env = gym.make(args.env_id)
+        # Episode statistics wrapper
+        env = RecordEpisodeStatistics(env)
+        env = StoreEpisodeReturnsAndLengths(env)
 
-            # Episode statistics wrapper
-            env = RecordEpisodeStatistics(env)
-            from utils.store_episode_returns_and_lengths import (
-                StoreEpisodeReturnsAndLengths,
-            )
+        # Normalization must come after stats for correct results
+        env = normalization.ScaleReward(env, gamma=args.gamma)
+        env = normalization.NormalizeObservation(env)
 
-            env = StoreEpisodeReturnsAndLengths(env)
-
-            # Normalization must come after stats for correct results
-            from utils import normalization
-
-            env = normalization.ScaleReward(env, gamma=args.gamma)
-            env = normalization.NormalizeObservation(env)
-
-            return env
-
-        return thunk
-
-    else:
-        raise ValueError(f"Unknown env_type: {args.env_type}")
+        return env
 
 
 # TODO make this faster / compatible with jax.jit
@@ -319,6 +311,22 @@ class RecordEpisodeStatisticsJAX(gym.Wrapper, gym.utils.RecordConstructorArgs):
         dones = jnp.logical_or(terminations, truncations)
         num_dones = jnp.sum(dones)
         if num_dones:
+            # if "episode" in infos or "_episode" in infos:
+            #     raise ValueError(
+            #         "Attempted to add episode stats when they already exist"
+            #     )
+            # else:
+            #     infos["episode"] = {
+            #         "r": jnp.where(dones, self.episode_returns, 0.0),
+            #         "l": jnp.where(dones, self.episode_lengths, 0),
+            #         "t": jnp.where(
+            #             dones,
+            #             jnp.round(time.perf_counter() - self.episode_start_times, 6),
+            #             0.0,
+            #         ),
+            #     }
+            #     if self.is_vector_env:
+            #         infos["_episode"] = jnp.where(dones, True, False)
             self.return_queue.extend(self.episode_returns[dones])
             self.length_queue.extend(self.episode_lengths[dones])
             self.episode_count += num_dones
@@ -473,32 +481,31 @@ class TrajectoryBuffer:
     K: int = struct.field(pytree_node=False)  # max length
 
     @classmethod
-    def create(cls, K, obs_shape):
+    def create(cls, K: int, obs_shape: tuple):
         return cls(
-            observations=jnp.zeros((K + 1, *obs_shape)),
+            observations=jnp.zeros((K + 1, *obs_shape), dtype=jnp.float32),
             actions=jnp.zeros((K,), dtype=jnp.int32),
             ptr=0,
             K=K,
         )
 
     def add(self, obs, action):
-        """Add observation and action to buffer."""
-        if self.K == 0:
-            # K=0: just store current observation, no actions needed
-            observations = jnp.asarray(self.observations).at[0].set(obs)
-            return self.replace(observations=observations, ptr=1)
-        new_ptr = (self.ptr + 1) % (self.K + 1)
-        observations = jnp.asarray(self.observations).at[self.ptr].set(obs)
-        actions = jnp.asarray(self.actions).at[self.ptr % self.K].set(action)
-        return self.replace(observations=observations, actions=actions, ptr=new_ptr)
+        """Add new observation and action, shifting if full."""
+        new_obs = jnp.roll(self.observations, -1, axis=0)
+        new_obs = new_obs.at[-1].set(obs)
+        new_actions = jnp.roll(self.actions, -1, axis=0)
+        new_actions = new_actions.at[-1].set(action)
+        return self.replace(
+            observations=new_obs,
+            actions=new_actions,
+            ptr=jnp.minimum(self.ptr + 1, self.K + 1),
+        )
 
     def reset(self):
-        """Reset buffer."""
         return self.replace(ptr=0)
 
     def is_full(self):
-        """Check if buffer has at least K+1 observations."""
-        return self.ptr >= self.K
+        return self.ptr >= self.K + 1
 
 
 def ema_update(target_params, online_params, tau):
@@ -506,246 +513,6 @@ def ema_update(target_params, online_params, tau):
     return jax.tree.map(
         lambda t, o: tau * t + (1 - tau) * o, target_params, online_params
     )
-
-
-def cosine_similarity_loss(pred, target):
-    """Negative cosine similarity with improved numerical stability."""
-    epsilon = 1e-8
-    pred_norm = pred / (jnp.linalg.norm(pred, axis=-1, keepdims=True) + epsilon)
-    target_norm = target / (jnp.linalg.norm(target, axis=-1, keepdims=True) + epsilon)
-    cos_sim = jnp.sum(pred_norm * target_norm, axis=-1)
-    # Clip to avoid numerical issues
-    cos_sim = jnp.clip(cos_sim, -1.0 + epsilon, 1.0 - epsilon)
-    return -cos_sim
-
-
-class AgentState(NamedTuple):
-    agent_config: Config
-    train_state: TrainState
-    h_state: TrainState
-    h_trace: jnp.ndarray  # the scalar trace for h (small z_t from the paper)
-    grad_h_trace: (
-        jnp.ndarray
-    )  # the trace of the gradient of h (z_t^{theta} from the paper)
-    grad_q_trace: jnp.ndarray  # the trace of the gradient of v (z_t^{w} from the paper)
-    # SPR components (optional)
-    target_encoder_state: Optional[TrainState]
-    proj_online_state: Optional[TrainState]
-    proj_target_state: Optional[TrainState]
-    predictor_state: Optional[TrainState]
-    transition_state: Optional[TrainState]
-    # Orthogonal gradient momentum (EMA of past gradients for decorrelation)
-    spr_momentum_online: Optional[jnp.ndarray]
-    spr_momentum_proj: Optional[jnp.ndarray]  # None if shared_online_proj is True
-    spr_momentum_pred: Optional[jnp.ndarray]
-    spr_momentum_trans: Optional[jnp.ndarray]
-
-
-@partial(jax.jit, static_argnames=["action_dim"])
-def agent_step(
-    agent_state: AgentState,
-    obs: jnp.ndarray,
-    action_dim: int,
-    epsilon: float,
-    rng: jax.random.PRNGKey,
-):
-    params = agent_state.train_state.params
-    q = agent_state.train_state.apply_fn(params, obs)
-    argmax = jnp.argmax(q)
-
-    rng, rng_e = jax.random.split(rng)
-
-    def random_action_fn(rng_in):
-        rng_out, rng_a = jax.random.split(rng_in)
-        action = jax.random.randint(rng_a, shape=(), minval=0, maxval=action_dim)
-        return action, rng_out
-
-    def greedy_action_fn(rng_in):
-        return argmax, rng_in
-
-    action, rng_out = jax.lax.cond(
-        jax.random.uniform(rng_e, minval=0.0, maxval=1.0) < epsilon,
-        random_action_fn,
-        greedy_action_fn,
-        rng,
-    )
-    is_nongreedy = action != argmax
-    return action, is_nongreedy, rng_out
-
-
-def init_agent_state_qrc_agent(
-    agent_config: Config,
-    action_dim: int,
-    obs_shape: tuple,
-    rng: jax.random.PRNGKey,
-    max_grad: float = 20.0,
-):
-    net_kwargs = {
-        "action_dim": action_dim,
-        "layer_norm": agent_config.layer_norm,
-        "activation": agent_config.activation,
-        "kernel_init": sparse_init(sparsity=agent_config.sparse_init),
-        "kernel_sizes": ((8, 8), (4, 4), (3, 3)),
-        "strides_list": ((4, 4), (2, 2), (1, 1)),
-    }
-    net_arch = agent_config.net_arch
-    if net_arch == "mlp":
-        net_kwargs["hiddens"] = agent_config.mlp_layers
-
-    train_states = []
-    lrs = [agent_config.q_lr, agent_config.h_lr_scale * agent_config.q_lr]
-
-    # one network for q and one for h
-    for net in range(2):
-        # For SPR, we use OctaxQNetworkSPR for all env types since it has the encoder structure
-        network = OctaxQNetworkSPR(**net_kwargs)
-        init_x = jnp.zeros(obs_shape)
-
-        rng, _rng = jax.random.split(rng)
-        params = network.init(_rng, init_x)
-
-        # Use gradient clipping for stability
-        tx = optax.chain(
-            optax.clip_by_global_norm(max_grad),
-            getattr(optax, agent_config.opt)(lrs[net]),
-        )
-
-        train_states.append(
-            TrainState.create(
-                apply_fn=network.apply,
-                params=params,
-                tx=tx,
-            )
-        )
-
-    grad_h_trace = jax.tree.map(jnp.zeros_like, train_states[1].params)
-    grad_v_trace = jax.tree.map(jnp.zeros_like, train_states[0].params)
-    h_trace = 0.0
-
-    # Target encoder
-    target_encoder = OctaxTargetEncoder(**net_kwargs)
-    rng, _rng = jax.random.split(rng)
-    target_encoder_params = target_encoder.init(_rng, jnp.zeros(obs_shape))
-    target_encoder_state = TrainState.create(
-        apply_fn=target_encoder.apply,
-        params=target_encoder_params,
-        tx=getattr(optax, agent_config.opt)(agent_config.q_lr),
-    )
-
-    # Helper for creating optimizers with clipping
-    def make_tx(lr):
-        return optax.chain(
-            optax.clip_by_global_norm(max_grad),
-            getattr(optax, agent_config.opt)(lr),
-        )
-
-    # Projection heads
-    if agent_config.shared_online_proj:
-        proj_online_state = None
-    else:
-        rng, _rng = jax.random.split(rng)
-        proj_online = OctaxProjection(**net_kwargs)
-        init_z = jnp.zeros((1, 7, 7, 64))  # Atari latent shape
-        proj_online_params = proj_online.init(_rng, init_z)
-        proj_online_state = TrainState.create(
-            apply_fn=proj_online.apply,
-            params=proj_online_params,
-            tx=make_tx(agent_config.q_lr),
-        )
-
-    rng, _rng = jax.random.split(rng)
-    proj_target = OctaxProjection(**net_kwargs)
-    init_z = jnp.zeros((1, 7, 7, 64))
-    proj_target_params = proj_target.init(_rng, init_z)
-    proj_target_state = TrainState.create(
-        apply_fn=proj_target.apply,
-        params=proj_target_params,
-        tx=getattr(optax, agent_config.opt)(agent_config.q_lr),
-    )
-
-    # Predictor
-    rng, _rng = jax.random.split(rng)
-    predictor = OctaxOnlinePrediction(**net_kwargs)
-    init_z = jnp.zeros((256,))
-    predictor_params = predictor.init(_rng, init_z)
-    predictor_state = TrainState.create(
-        apply_fn=predictor.apply,
-        params=predictor_params,
-        tx=make_tx(agent_config.q_lr),
-    )
-
-    # Transition model (skip when K=0 -- no multi-step prediction)
-    transition_state = None
-    if agent_config.spr_prediction_depth > 0:
-        rng, _rng = jax.random.split(rng)
-        transition_model = OctaxTransitionNetwork(**net_kwargs)
-        init_z = jnp.zeros((1, 7, 7, 64))
-        transition_params = transition_model.init(_rng, init_z, jnp.int32(0))
-        transition_state = TrainState.create(
-            apply_fn=transition_model.apply,
-            params=transition_params,
-            tx=make_tx(agent_config.q_lr),
-        )
-
-    def params_sum(params):
-        return sum(
-            jax.tree_util.tree_leaves(jax.tree.map(lambda x: np.prod(x.shape), params))
-        )
-
-    total_params = (
-        params_sum(train_states[0].params)
-        + params_sum(train_states[1].params)
-        + (params_sum(proj_online_state.params) if proj_online_state is not None else 0)
-        + params_sum(proj_target_state.params)
-        + params_sum(predictor_state.params)
-        + (params_sum(transition_state.params) if transition_state is not None else 0)
-    )
-
-    print(f"Total number of params: {total_params}")
-
-    # Initialize orthogonal gradient momentum states (EMA of past gradients)
-    spr_momentum_online = jax.tree.map(jnp.zeros_like, train_states[0].params)
-    spr_momentum_proj = (
-        jax.tree.map(jnp.zeros_like, proj_online_state.params)
-        if proj_online_state is not None
-        else None
-    )
-    spr_momentum_pred = jax.tree.map(jnp.zeros_like, predictor_state.params)
-    spr_momentum_trans = (
-        jax.tree.map(jnp.zeros_like, transition_state.params)
-        if transition_state is not None
-        else None
-    )
-
-    return (
-        AgentState(
-            agent_config,
-            *train_states,
-            h_trace,
-            grad_h_trace,
-            grad_v_trace,
-            target_encoder_state,
-            proj_online_state,
-            proj_target_state,
-            predictor_state,
-            transition_state,
-            spr_momentum_online,
-            spr_momentum_proj,
-            spr_momentum_pred,
-            spr_momentum_trans,
-        ),
-        rng,
-    )
-
-
-def update_q_trace(e_tmins1, rho_t, gamma, lamda, grad):
-    # e_{t} = rho_t*gamma*lamda*e_{t-1} + grad)
-    e_t = jax.tree.map(lambda x, y: (rho_t * gamma * lamda * x) + y, e_tmins1, grad)
-    return e_t
-
-
-def reset_trace(trace):
-    return tree.zeros(trace)
 
 
 def orthogonal_gradient_projection(grad_t, momentum_t):
@@ -782,6 +549,62 @@ def orthogonal_gradient_projection(grad_t, momentum_t):
     return orthogonal_grad
 
 
+def orthogonal_component_against(update_t, reference_t, epsilon=1e-8):
+    """Project ``update_t`` to be orthogonal to ``reference_t`` and return cosine similarity."""
+    update_flat, _ = jax.tree_util.tree_flatten(update_t)
+    reference_flat, _ = jax.tree_util.tree_flatten(reference_t)
+
+    dot_update_ref = sum([jnp.sum(u * r) for u, r in zip(update_flat, reference_flat)])
+    ref_norm_sq = sum([jnp.sum(r * r) for r in reference_flat])
+    update_norm_sq = sum([jnp.sum(u * u) for u in update_flat])
+
+    projection_coeff = dot_update_ref / (ref_norm_sq + epsilon)
+    orthogonal_update = jax.tree.map(
+        lambda u, r: u - projection_coeff * r, update_t, reference_t
+    )
+
+    cosine = dot_update_ref / (
+        jnp.sqrt((update_norm_sq + epsilon) * (ref_norm_sq + epsilon)) + epsilon
+    )
+    cosine = jnp.clip(cosine, -1.0, 1.0)
+    return orthogonal_update, cosine
+
+
+def pcgrad(grad_spr, grad_rl, epsilon=1e-8):
+    """
+    PCGrad: when two task gradients conflict (negative cosine similarity),
+    project each onto the normal plane of the other.
+
+    Reference: Yu et al., "Gradient Surgery for Multi-Task Learning", NeurIPS 2020.
+
+    Args:
+        grad_spr: SPR gradient on shared encoder (pytree)
+        grad_rl: RL gradient on shared encoder (pytree)
+
+    Returns:
+        (modified_spr, modified_rl, cosine_similarity)
+    """
+    flat_spr, _ = jax.tree_util.tree_flatten(grad_spr)
+    flat_rl, _ = jax.tree_util.tree_flatten(grad_rl)
+
+    dot = sum(jnp.sum(s * r) for s, r in zip(flat_spr, flat_rl))
+    norm_rl_sq = sum(jnp.sum(r * r) for r in flat_rl)
+    norm_spr_sq = sum(jnp.sum(s * s) for s in flat_spr)
+
+    # Only project when gradients conflict (negative dot product)
+    conflict = dot < 0
+    coeff_spr = jnp.where(conflict, dot / (norm_rl_sq + epsilon), 0.0)
+    coeff_rl = jnp.where(conflict, dot / (norm_spr_sq + epsilon), 0.0)
+
+    new_spr = jax.tree.map(lambda s, r: s - coeff_spr * r, grad_spr, grad_rl)
+    new_rl = jax.tree.map(lambda r, s: r - coeff_rl * s, grad_rl, grad_spr)
+
+    cosine = dot / (jnp.sqrt(norm_spr_sq * norm_rl_sq) + epsilon)
+    cosine = jnp.clip(cosine, -1.0, 1.0)
+
+    return new_spr, new_rl, cosine
+
+
 def update_momentum(momentum_t, grad_t, beta):
     """
     Update EMA momentum with current gradient.
@@ -799,9 +622,270 @@ def update_momentum(momentum_t, grad_t, beta):
     return jax.tree.map(lambda m, g: beta * m + (1.0 - beta) * g, momentum_t, grad_t)
 
 
-## Updates for QRC(λ) agent. Equations (26)-(28) in the paper
+def cosine_similarity_loss(pred, target):
+    """Negative cosine similarity with improved numerical stability."""
+    epsilon = 1e-8
+    pred_norm = pred / (jnp.linalg.norm(pred, axis=-1, keepdims=True) + epsilon)
+    target_norm = target / (jnp.linalg.norm(target, axis=-1, keepdims=True) + epsilon)
+    cos_sim = jnp.sum(pred_norm * target_norm, axis=-1)
+    # Clip to avoid numerical issues
+    cos_sim = jnp.clip(cos_sim, -1.0 + epsilon, 1.0 - epsilon)
+    return -cos_sim
+
+
+class AgentState(NamedTuple):
+    agent_config: Config
+    train_state: TrainState
+    # SPR components
+    target_encoder_state: Optional[TrainState]
+    proj_online_state: Optional[TrainState]
+    proj_target_state: Optional[TrainState]
+    predictor_state: Optional[TrainState]
+    transition_state: Optional[TrainState]
+    # Orthogonal SPR momentum terms
+    spr_momentum_online: Optional[any]  # momentum for shared encoder
+    spr_momentum_proj: Optional[any]  # momentum for projection head
+    spr_momentum_pred: Optional[any]  # momentum for predictor
+    spr_momentum_trans: Optional[any]  # momentum for transition model
+    obgd_momentum: Optional[any]  # EMA of ObGD RL encoder updates (for A6 ablation)
+
+
+@partial(jax.jit, static_argnames=["action_dim"])
+def agent_step(
+    agent_state: AgentState,
+    obs: jnp.ndarray,
+    action_dim: int,
+    epsilon: float,
+    rng: jax.random.PRNGKey,
+):
+    params = agent_state.train_state.params
+    q = agent_state.train_state.apply_fn(params, obs)
+    argmax = jnp.argmax(q)
+
+    rng, rng_e = jax.random.split(rng)
+
+    def random_action_fn(rng_in):
+        rng_out, rng_a = jax.random.split(rng_in)
+        action = jax.random.randint(rng_a, shape=(), minval=0, maxval=action_dim)
+        return action, rng_out
+
+    def greedy_action_fn(rng_in):
+        return argmax, rng_in
+
+    action, rng_out = jax.lax.cond(
+        jax.random.uniform(rng_e, minval=0.0, maxval=1.0) < epsilon,
+        random_action_fn,
+        greedy_action_fn,
+        rng,
+    )
+    is_nongreedy = action != argmax
+    return action, is_nongreedy, rng_out
+
+
+def init_agent_state_streamq(
+    agent_config: Config, action_dim: int, obs_shape: tuple, rng: jax.random.PRNGKey
+):
+    if agent_config.env_type == "atari":
+        net_kwargs = {
+            "action_dim": action_dim,
+            "layer_norm": agent_config.layer_norm,
+            "activation": agent_config.activation,
+            "kernel_init": sparse_init(sparsity=agent_config.sparse_init),
+            "features_list": (32, 64, 64),
+            "kernel_sizes": ((8, 8), (4, 4), (3, 3)),
+            "strides_list": ((4, 4), (2, 2), (1, 1)),
+            "hidden_layer_sizes": (256,),
+            "dyn_features_list": (64, 64),
+            "dyn_kernel_sizes": ((3, 3), (3, 3)),
+            "dyn_strides_list": ((1, 1), (1, 1)),
+        }
+    elif agent_config.env_type == "octax":
+        net_kwargs = {
+            "action_dim": action_dim,
+            "layer_norm": agent_config.layer_norm,
+            "activation": agent_config.activation,
+            "kernel_init": sparse_init(sparsity=agent_config.sparse_init),
+            "features_list": (32, 64, 64),
+            "kernel_sizes": ((8, 8), (4, 4), (3, 3)),
+            "strides_list": ((4, 4), (2, 2), (1, 1)),
+            "hidden_layer_sizes": (256,),
+            "dyn_features_list": (64, 64),
+            "dyn_kernel_sizes": ((3, 3), (3, 3)),
+            "dyn_strides_list": ((1, 1), (1, 1)),
+        }
+    elif agent_config.env_type == "minatar":
+        net_kwargs = {
+            "action_dim": action_dim,
+            "layer_norm": agent_config.layer_norm,
+            "activation": agent_config.activation,
+            "kernel_init": sparse_init(sparsity=agent_config.sparse_init),
+            "features_list": (16,),
+            "kernel_sizes": ((3, 3)),
+            "strides_list": ((1, 1)),
+            "hidden_layer_sizes": (128,),
+            "dyn_features_list": (16, 16),
+            "dyn_kernel_sizes": ((3, 3), (3, 3)),
+            "dyn_strides_list": ((1, 1), (1, 1)),
+        }
+    else:
+        raise ValueError(f"unknown environment type: {agent_config.env_type}")
+    net_arch = agent_config.net_arch
+    if net_arch == "mlp":
+        net_kwargs["hiddens"] = agent_config.mlp_layers
+
+    network = OctaxQNetworkSPR(**net_kwargs)
+    init_x = jnp.zeros(obs_shape)
+
+    # Initialize network parameters
+    rng, _rng = jax.random.split(rng)
+    params = network.init(_rng, init_x)
+
+    def params_sum(params):
+        return sum(
+            jax.tree_util.tree_leaves(jax.tree.map(lambda x: np.prod(x.shape), params))
+        )
+
+    print(f"Total number of params: {params_sum(params)}")
+
+    # Create optimizer
+    tx_cls = {
+        "obgd": obgd_with_traces,
+        "sgd": sgd_with_traces,
+    }[agent_config.opt]
+
+    # Configure optimizer arguments
+    opt_kwrgs = {
+        "lr": agent_config.q_lr,
+        "gamma": agent_config.gamma,
+        "lambd": agent_config.lamda,
+    }
+
+    if agent_config.opt == "obgd":
+        opt_kwrgs["kappa"] = agent_config.kappa
+
+    tx = tx_cls(**opt_kwrgs)
+
+    # Create train state
+    train_state = TrainState.create(
+        apply_fn=network.apply,
+        params=params,
+        tx=tx,
+    )
+
+    # Initialize SPR components
+    target_encoder_state = None
+    proj_online_state = None
+    proj_target_state = None
+    predictor_state = None
+    transition_state = None
+
+    # Initialize momentum terms
+    spr_momentum_online = None
+    spr_momentum_proj = None
+    spr_momentum_pred = None
+    spr_momentum_trans = None
+    obgd_momentum = None
+
+    if agent_config.use_spr:
+        # Helper for creating optimizers
+        def make_spr_tx():
+            return optax.sgd(agent_config.q_lr)
+
+        # Target Encoder
+        target_encoder = OctaxTargetEncoder(**net_kwargs)
+        rng, _rng = jax.random.split(rng)
+        target_encoder_params = target_encoder.init(_rng, jnp.zeros(obs_shape))
+        target_encoder_state = TrainState.create(
+            apply_fn=target_encoder.apply,
+            params=target_encoder_params,
+            tx=make_spr_tx(),
+        )
+
+        # Initialize momentum for shared encoder to decorrelate streaming updates
+        spr_momentum_online = jax.tree.map(jnp.zeros_like, params)
+
+        # Infer latent shape by running a dummy pass
+        dummy_out = target_encoder.apply(
+            target_encoder_params, jnp.zeros((1, *obs_shape))
+        )
+        # Note: dummy_out might include batch dim
+
+        # Projection heads
+
+        if not agent_config.shared_online_proj:
+            rng, _rng = jax.random.split(rng)
+            proj_online = OctaxProjection(**net_kwargs)
+            proj_online_params = proj_online.init(_rng, dummy_out)
+            proj_online_state = TrainState.create(
+                apply_fn=proj_online.apply,
+                params=proj_online_params,
+                tx=make_spr_tx(),
+            )
+            spr_momentum_proj = jax.tree.map(jnp.zeros_like, proj_online_params)
+
+        rng, _rng = jax.random.split(rng)
+        proj_target = OctaxProjection(**net_kwargs)
+        proj_target_params = proj_target.init(_rng, dummy_out)
+        proj_target_state = TrainState.create(
+            apply_fn=proj_target.apply,
+            params=proj_target_params,
+            tx=make_spr_tx(),
+        )
+
+        # Run dummy projection to get shape for Predictor/Transition
+        dummy_proj = proj_target.apply(proj_target_params, dummy_out)
+
+        # Predictor
+        # Predictor operates on projected output
+        rng, _rng = jax.random.split(rng)
+        predictor = OctaxOnlinePrediction(**net_kwargs)
+        predictor_params = predictor.init(_rng, dummy_proj)
+        predictor_state = TrainState.create(
+            apply_fn=predictor.apply,
+            params=predictor_params,
+            tx=make_spr_tx(),
+        )
+        spr_momentum_pred = jax.tree.map(jnp.zeros_like, predictor_params)
+
+        # Transition model
+        # Transition model operates on Latent state (dummy_out), NOT projected state
+        rng, _rng = jax.random.split(rng)
+        transition_model = OctaxTransitionNetwork(**net_kwargs)
+        transition_params = transition_model.init(_rng, dummy_out, jnp.int32(0))
+        transition_state = TrainState.create(
+            apply_fn=transition_model.apply,
+            params=transition_params,
+            tx=make_spr_tx(),
+        )
+        spr_momentum_trans = jax.tree.map(jnp.zeros_like, transition_params)
+
+        # For A6 ablation: EMA of ObGD encoder updates
+        if "params" in params and "online_encoder" in params["params"]:
+            obgd_momentum = jax.tree.map(jnp.zeros_like, params["params"]["online_encoder"])
+
+        print("SPR Components Initialized")
+
+    return (
+        AgentState(
+            agent_config,
+            train_state,
+            target_encoder_state,
+            proj_online_state,
+            proj_target_state,
+            predictor_state,
+            transition_state,
+            spr_momentum_online,
+            spr_momentum_proj,
+            spr_momentum_pred,
+            spr_momentum_trans,
+            obgd_momentum,
+        ),
+        rng,
+    )
+
+
 @partial(jax.jit, static_argnames=["terminated", "truncated", "is_nongreedy"])
-def update_step_qrc_agent(
+def update_step_streamq(
     agent_state,
     transition,
     terminated,
@@ -814,402 +898,317 @@ def update_step_qrc_agent(
 
     config = agent_state.agent_config
     train_state = agent_state.train_state
-    q_params = train_state.params
-    h_params = agent_state.h_state.params
-    h_tm1 = agent_state.h_trace
-    grad_h_trace_tm1 = agent_state.grad_h_trace
-    grad_q_trace_tm1 = agent_state.grad_q_trace
+    params = train_state.params
+    opt_state = train_state.opt_state
 
-    # Initialize momentum with current state
-    spr_momentum_online = agent_state.spr_momentum_online
-    spr_momentum_proj = agent_state.spr_momentum_proj
-    spr_momentum_pred = agent_state.spr_momentum_pred
-    spr_momentum_trans = agent_state.spr_momentum_trans
-
-    # QRC-lambda updates
     def get_q(params):
         q = train_state.apply_fn(params, obs)
         return q[action]
 
-    q_grads = jax.grad(get_q)(q_params)
+    q_taken, grads = jax.value_and_grad(get_q)(params)
 
-    def get_td_error(params):
-        q = train_state.apply_fn(params, obs)
-        q_taken = q[action]
+    td_error = reward - q_taken
+    if not terminated:
         next_q_vect = train_state.apply_fn(params, next_obs)
-        td_error = (
-            (config.gamma * jnp.max(next_q_vect, axis=-1)) * (1 - terminated)
-            + reward
-            - q_taken
-        )
-        return td_error.squeeze(), q_taken
+        td_error += config.gamma * jnp.max(next_q_vect, axis=-1)
 
-    (td_error, q_val), td_error_grad = jax.value_and_grad(get_td_error, has_aux=True)(
-        q_params
+    tx = train_state.tx
+    updates, opt_state = tx.update(
+        grads,
+        opt_state,
+        params,
+        td_error,
+        reset=(terminated or truncated or is_nongreedy),
     )
 
-    def get_h(params):
-        h = agent_state.h_state.apply_fn(params, obs)
-        return h[action]
+    rl_encoder_update = None
+    updates_params = updates.get("params") if hasattr(updates, "get") else None
+    if updates_params is not None and "online_encoder" in updates_params:
+        rl_encoder_update = updates_params["online_encoder"]
 
-    h_t, h_grads = jax.value_and_grad(get_h)(h_params)
-    rho_t = 1.0
-    h_trace_t = (rho_t * config.gamma * config.lamda * h_tm1) + h_t
-    grad_h_trace_t = update_q_trace(
-        grad_h_trace_tm1, rho_t, config.gamma, config.lamda, h_grads
-    )
-    grad_q_trace_t = update_q_trace(
-        grad_q_trace_tm1, rho_t, config.gamma, config.lamda, q_grads
-    )
-
-    # QRC Q-network update
-    q_update = tree.scale(-h_trace_t, td_error_grad)
-    if config.gradient_correction:
-        q_update = tree.add(
-            tree.scale(td_error, grad_q_trace_t),
-            tree.scale(-h_t, q_grads),
-            q_update,
-        )
-
-    # SPR loss computation
-    spr_loss = 0.0
-    mse_loss = 0.0
-    y_mag = 0.0
-
-    if traj_buffer is not None and rng is not None:
-        spr_grads_online = jax.tree.map(jnp.zeros_like, q_params)
-        spr_grads_proj = (
-            jax.tree.map(jnp.zeros_like, agent_state.proj_online_state.params)
-            if agent_state.proj_online_state is not None
-            else None
-        )
-        spr_grads_pred = jax.tree.map(
-            jnp.zeros_like, agent_state.predictor_state.params
-        )
-        spr_grads_trans = (
-            jax.tree.map(jnp.zeros_like, agent_state.transition_state.params)
-            if agent_state.transition_state is not None
-            else None
-        )
-
-        if config.spr_prediction_depth == 0:
-            # K=0: no transition network. Compare online and target encoder
-            # outputs for the current observation (representation regularizer).
-            def spr_loss_fn_k0(online_params, proj_online_params, predictor_params):
-                rng_aug = jax.random.split(rng, 2)
-
-                # Online: encode current obs
-                z_online = agent_state.train_state.apply_fn(
-                    online_params,
-                    obs,
-                    method="get_online_latent",
-                    use_augmentation=config.use_augmentation,
-                    rng=rng_aug[0],
-                )
-                if config.shared_online_proj:
-                    y_online = agent_state.train_state.apply_fn(
-                        online_params, z_online, method="get_online_projection"
-                    )
-                else:
-                    y_online = agent_state.proj_online_state.apply_fn(
-                        proj_online_params, z_online
-                    )
-                y_pred = agent_state.predictor_state.apply_fn(
-                    predictor_params, y_online
-                )
-
-                # Target: encode same obs with target encoder (stop gradient)
-                z_target = agent_state.target_encoder_state.apply_fn(
-                    agent_state.target_encoder_state.params,
-                    obs,
-                    use_augmentation=config.use_augmentation,
-                    rng=rng_aug[1],
-                )
-                z_target = jax.lax.stop_gradient(z_target)
-                y_target = agent_state.proj_target_state.apply_fn(
-                    agent_state.proj_target_state.params, z_target
-                )
-                y_target = jax.lax.stop_gradient(y_target)
-
-                spr_loss_val = jnp.mean(cosine_similarity_loss(y_pred, y_target))
-                mse_loss_val = jnp.mean((y_pred - y_target) ** 2)
-                y_mag_val = (
-                    jnp.mean(jnp.abs(y_pred)) + jnp.mean(jnp.abs(y_target))
-                ) / 2
-
-                return spr_loss_val, (mse_loss_val, y_mag_val)
-
-        def spr_loss_fn(
-            online_params, proj_online_params, predictor_params, transition_params
-        ):
-            rng_aug = jax.random.split(rng, config.spr_prediction_depth + 1)
-
-            z_0 = agent_state.train_state.apply_fn(
-                online_params,
-                traj_buffer.observations[0],
-                method="get_online_latent",
-                use_augmentation=config.use_augmentation,
-                rng=rng_aug[0],
-            )
-
-            spr_loss_accum = 0.0
-            mse_loss_accum = 0.0
-            y_mag_accum = 0.0
-            z_pred = z_0
-
-            for k in range(1, config.spr_prediction_depth + 1):
-                z_pred = agent_state.transition_state.apply_fn(
-                    transition_params, z_pred, traj_buffer.actions[k - 1]
-                )
-
-                if config.shared_online_proj:
-                    y_online = agent_state.train_state.apply_fn(
-                        online_params, z_pred, method="get_online_projection"
-                    )
-                else:
-                    y_online = agent_state.proj_online_state.apply_fn(
-                        proj_online_params, z_pred
-                    )
-                y_pred = agent_state.predictor_state.apply_fn(
-                    predictor_params, y_online
-                )
-
-                z_target = agent_state.target_encoder_state.apply_fn(
-                    agent_state.target_encoder_state.params,
-                    traj_buffer.observations[k],
-                    use_augmentation=config.use_augmentation,
-                    rng=rng_aug[k],
-                )
-                z_target = jax.lax.stop_gradient(z_target)
-                y_target = agent_state.proj_target_state.apply_fn(
-                    agent_state.proj_target_state.params, z_target
-                )
-                y_target = jax.lax.stop_gradient(y_target)
-
-                spr_loss_accum += cosine_similarity_loss(y_pred, y_target)
-                mse_loss_accum += jnp.mean((y_pred - y_target) ** 2)
-                y_mag_accum += (
-                    jnp.mean(jnp.abs(y_pred)) + jnp.mean(jnp.abs(y_target))
-                ) / 2
-
-            spr_loss_avg = jnp.mean(spr_loss_accum / config.spr_prediction_depth)
-            mse_loss_avg = jnp.mean(mse_loss_accum / config.spr_prediction_depth)
-            y_mag_avg = y_mag_accum / config.spr_prediction_depth
-
-            return spr_loss_avg, (mse_loss_avg, y_mag_avg)
-
-        if config.spr_prediction_depth == 0:
-            # K=0: no transition network
-            def compute_spr():
-                if config.shared_online_proj:
-                    (spr_loss_val, (mse_loss_val, y_mag_val)), (
-                        g_online,
-                        g_pred,
-                    ) = jax.value_and_grad(
-                        lambda qp, pp: spr_loss_fn_k0(qp, None, pp),
-                        argnums=(0, 1),
-                        has_aux=True,
-                    )(
-                        q_params,
-                        agent_state.predictor_state.params,
-                    )
-                    return (
-                        spr_loss_val, mse_loss_val, y_mag_val,
-                        g_online, None, g_pred, None,
-                    )
-                else:
-                    (spr_loss_val, (mse_loss_val, y_mag_val)), (
-                        g_online, g_proj, g_pred,
-                    ) = jax.value_and_grad(spr_loss_fn_k0, argnums=(0, 1, 2), has_aux=True)(
-                        q_params,
-                        agent_state.proj_online_state.params,
-                        agent_state.predictor_state.params,
-                    )
-                    return (
-                        spr_loss_val, mse_loss_val, y_mag_val,
-                        g_online, g_proj, g_pred, None,
-                    )
-
-            def skip_spr():
-                return (
-                    0.0, 0.0, 0.0,
-                    spr_grads_online, spr_grads_proj, spr_grads_pred, None,
-                )
-
-            # K=0: always compute (no traj_buffer fullness check needed)
-            should_compute = (~terminated) & (~truncated) & (~is_nongreedy)
-            (
-                spr_loss, mse_loss, y_mag,
-                spr_grads_online, spr_grads_proj, spr_grads_pred, _,
-            ) = jax.lax.cond(should_compute, compute_spr, skip_spr)
-            spr_grads_trans = None
-
+    # For PCGrad: defer encoder update, apply non-encoder RL updates first
+    if config.orthogonalize_shared_encoder and rl_encoder_update is not None:
+        # Zero out encoder update from the RL update vector
+        if isinstance(updates, frozen_dict.FrozenDict):
+            updates_mut = frozen_dict.unfreeze(updates)
         else:
-            # K > 0: standard multi-step SPR
-            def compute_spr():
-                if config.shared_online_proj:
-                    (spr_loss_val, (mse_loss_val, y_mag_val)), (
-                        g_online,
-                        g_pred,
-                        g_trans,
-                    ) = jax.value_and_grad(
-                        lambda qp, pp, tp: spr_loss_fn(qp, None, pp, tp),
-                        argnums=(0, 1, 2),
-                        has_aux=True,
-                    )(
-                        q_params,
-                        agent_state.predictor_state.params,
-                        agent_state.transition_state.params,
-                    )
-                    return (
-                        spr_loss_val, mse_loss_val, y_mag_val,
-                        g_online, None, g_pred, g_trans,
-                    )
-                else:
-                    (spr_loss_val, (mse_loss_val, y_mag_val)), (
-                        g_online, g_proj, g_pred, g_trans,
-                    ) = jax.value_and_grad(spr_loss_fn, argnums=(0, 1, 2, 3), has_aux=True)(
-                        q_params,
-                        agent_state.proj_online_state.params,
-                        agent_state.predictor_state.params,
-                        agent_state.transition_state.params,
-                    )
-                    return (
-                        spr_loss_val, mse_loss_val, y_mag_val,
-                        g_online, g_proj, g_pred, g_trans,
-                    )
+            updates_mut = {**updates}
+        params_block = updates_mut.get("params", {})
+        if isinstance(params_block, frozen_dict.FrozenDict):
+            params_block = frozen_dict.unfreeze(params_block)
+        else:
+            params_block = {**params_block}
+        params_block["online_encoder"] = jax.tree.map(jnp.zeros_like, rl_encoder_update)
+        updates_mut["params"] = params_block
+        params = optax.apply_updates(params, updates_mut)
+    else:
+        # Apply all RL updates normally
+        params = optax.apply_updates(params, updates)
 
-            def skip_spr():
-                return (
-                    0.0, 0.0, 0.0,
-                    spr_grads_online, spr_grads_proj, spr_grads_pred, spr_grads_trans,
+    # SPR updates
+    spr_loss = 0.0
+    encoder_update_cos = jnp.array(0.0, dtype=jnp.float32)
+
+    target_encoder_state = agent_state.target_encoder_state
+    proj_online_state = agent_state.proj_online_state
+    proj_target_state = agent_state.proj_target_state
+    predictor_state = agent_state.predictor_state
+    transition_state = agent_state.transition_state
+
+    spr_momentum_online = agent_state.spr_momentum_online
+    spr_momentum_proj = agent_state.spr_momentum_proj
+    spr_momentum_pred = agent_state.spr_momentum_pred
+    spr_momentum_trans = agent_state.spr_momentum_trans
+    obgd_momentum = agent_state.obgd_momentum
+
+    if config.use_spr and traj_buffer is not None and rng is not None:
+        spr_obs = traj_buffer.observations
+        spr_actions = traj_buffer.actions
+
+        # Target Projections (No grad)
+        target_latents = target_encoder_state.apply_fn(
+            target_encoder_state.params, spr_obs
+        )
+        target_projections = proj_target_state.apply_fn(
+            proj_target_state.params, target_latents
+        )
+        target_projections = target_projections[1:]  # Targets t=1..K
+
+        def spr_loss_fn(online_params, online_proj_params, pred_params, trans_params):
+            # Online projections
+            # Map online_params to target_encoder structure to reuse apply_fn
+            enc_params_mapped = {
+                "params": {"target_encoder": online_params["params"]["online_encoder"]}
+            }
+            # Start with z_0 (Latent), keep batch dim
+            z_curr = target_encoder_state.apply_fn(
+                enc_params_mapped, spr_obs[0][None, ...]
+            )
+
+            loss = 0.0
+
+            for k in range(config.spr_prediction_depth):
+                # Transition z_t -> z_{t+1}
+                z_curr = transition_state.apply_fn(
+                    trans_params, z_curr, spr_actions[k][None, ...]
                 )
 
-            (
-                spr_loss, mse_loss, y_mag,
-                spr_grads_online, spr_grads_proj, spr_grads_pred, spr_grads_trans,
-            ) = jax.lax.cond(
-                traj_buffer.is_full() & (~terminated) & (~truncated) & (~is_nongreedy),
-                compute_spr,
-                skip_spr,
+                # Project z_{t+1} -> y_{t+1}
+                if config.shared_online_proj:
+                    proj_params_mapped = {
+                        "params": {"proj": online_params["params"]["q_projection"]}
+                    }
+                    y_curr = proj_target_state.apply_fn(proj_params_mapped, z_curr)
+                else:
+                    y_curr = proj_online_state.apply_fn(online_proj_params, z_curr)
+
+                # Predict y_{t+1}
+                pred = predictor_state.apply_fn(pred_params, y_curr)
+
+                # Target is (K, F), k-th element is (F,). Expand to (1, F)
+                target = target_projections[k][None, ...]
+                loss_k = cosine_similarity_loss(pred, target)
+                loss += jnp.mean(loss_k)
+
+            return loss / config.spr_prediction_depth
+
+        # Compute Gradients (only when trajectory buffer is ready)
+        spr_grads_fn = jax.grad(spr_loss_fn, argnums=(0, 1, 2, 3))
+
+        zero_online = jax.tree.map(jnp.zeros_like, params)
+        zero_proj = (
+            jax.tree.map(jnp.zeros_like, proj_online_state.params)
+            if proj_online_state
+            else None
+        )
+        zero_pred = jax.tree.map(jnp.zeros_like, predictor_state.params)
+        zero_trans = jax.tree.map(jnp.zeros_like, transition_state.params)
+
+        buffer_ready = jnp.asarray(traj_buffer.is_full(), dtype=jnp.bool_)
+        not_terminated = jnp.logical_not(jnp.asarray(terminated, dtype=jnp.bool_))
+        not_truncated = jnp.logical_not(jnp.asarray(truncated, dtype=jnp.bool_))
+        not_nongreedy = jnp.logical_not(jnp.asarray(is_nongreedy, dtype=jnp.bool_))
+        spr_condition = buffer_ready & not_terminated & not_truncated & not_nongreedy
+
+        def compute_spr(_):
+            grads_online, grads_proj, grads_pred, grads_trans = spr_grads_fn(
+                params,
+                proj_online_state.params if proj_online_state else None,
+                predictor_state.params,
+                transition_state.params,
+            )
+            loss_val = spr_loss_fn(
+                params,
+                proj_online_state.params if proj_online_state else None,
+                predictor_state.params,
+                transition_state.params,
+            )
+            return loss_val, grads_online, grads_proj, grads_pred, grads_trans
+
+        def skip_spr(_):
+            return (
+                jnp.array(0.0, dtype=jnp.float32),
+                zero_online,
+                zero_proj,
+                zero_pred,
+                zero_trans,
             )
 
-        # Apply orthogonal gradient projection
-        spr_grads_online = orthogonal_gradient_projection(
-            spr_grads_online, spr_momentum_online
+        spr_loss, grads_online, grads_proj, grads_pred, grads_trans = jax.lax.cond(
+            spr_condition,
+            compute_spr,
+            skip_spr,
+            operand=None,
         )
-        if not config.shared_online_proj:
-            spr_grads_proj = orthogonal_gradient_projection(
-                spr_grads_proj, spr_momentum_proj
+
+        if spr_momentum_online is not None:
+            grads_online = orthogonal_gradient_projection(
+                grads_online, spr_momentum_online
             )
-        spr_grads_pred = orthogonal_gradient_projection(
-            spr_grads_pred, spr_momentum_pred
-        )
-        if spr_grads_trans is not None and spr_momentum_trans is not None:
-            spr_grads_trans = orthogonal_gradient_projection(
-                spr_grads_trans, spr_momentum_trans
+            spr_momentum_online = update_momentum(
+                spr_momentum_online, grads_online, config.orth_beta
             )
 
-        # Update momentum
-        spr_momentum_online = update_momentum(
-            spr_momentum_online, spr_grads_online, config.orth_beta
+        # Apply orthogonal gradient projection for auxiliary heads
+        # 1. Projection head
+        if not config.shared_online_proj and proj_online_state:
+            grads_proj = orthogonal_gradient_projection(grads_proj, spr_momentum_proj)
+            spr_momentum_proj = update_momentum(spr_momentum_proj, grads_proj, config.orth_beta)
+
+        # 2. Predictor
+        grads_pred = orthogonal_gradient_projection(grads_pred, spr_momentum_pred)
+        spr_momentum_pred = update_momentum(spr_momentum_pred, grads_pred, config.orth_beta)
+
+        # 3. Transition
+        grads_trans = orthogonal_gradient_projection(grads_trans, spr_momentum_trans)
+        spr_momentum_trans = update_momentum(spr_momentum_trans, grads_trans, config.orth_beta)
+
+        # Apply Updates
+        # 1. Online Encoder (shared) - add to params with orthogonalization
+        spr_update_vec = jax.tree.map(
+            lambda g: -config.q_lr * config.spr_weight * g, grads_online
         )
-        if not config.shared_online_proj:
-            spr_momentum_proj = update_momentum(spr_momentum_proj, spr_grads_proj, config.orth_beta)
-        spr_momentum_pred = update_momentum(spr_momentum_pred, spr_grads_pred, config.orth_beta)
-        if spr_momentum_trans is not None and spr_grads_trans is not None:
-            spr_momentum_trans = update_momentum(spr_momentum_trans, spr_grads_trans, config.orth_beta)
 
-        # Combine QRC and SPR gradients
-        q_update = jax.tree.map(
-            lambda qrc_g, spr_g: qrc_g + config.spr_weight * spr_g,
-            q_update,
-            spr_grads_online,
+        # PCGrad: resolve gradient conflict between RL and SPR on shared encoder
+        if (
+            config.orthogonalize_shared_encoder
+            and rl_encoder_update is not None
+            and "params" in spr_update_vec
+            and "online_encoder" in spr_update_vec["params"]
+        ):
+            spr_encoder_update = spr_update_vec["params"]["online_encoder"]
+
+            # Apply PCGrad: symmetrically project conflicting gradients
+            # Note: rl_encoder_update and spr_encoder_update are updates (negative gradients)
+            pcgrad_spr, pcgrad_rl, encoder_update_cos = pcgrad(
+                spr_encoder_update, rl_encoder_update
+            )
+
+            # Replace SPR encoder update with PCGrad version
+            if isinstance(spr_update_vec, frozen_dict.FrozenDict):
+                spr_update_mut = frozen_dict.unfreeze(spr_update_vec)
+            else:
+                spr_update_mut = {**spr_update_vec}
+
+            params_block = spr_update_mut.get("params", {})
+            if isinstance(params_block, frozen_dict.FrozenDict):
+                params_block = frozen_dict.unfreeze(params_block)
+            else:
+                params_block = {**params_block}
+
+            params_block["online_encoder"] = pcgrad_spr
+            spr_update_mut["params"] = params_block
+            spr_update_vec = spr_update_mut
+
+            # Apply the deferred RL encoder update (PCGrad-modified)
+            rl_encoder_update_tree = jax.tree.map(jnp.zeros_like, params)
+            if isinstance(rl_encoder_update_tree, frozen_dict.FrozenDict):
+                rl_mut = frozen_dict.unfreeze(rl_encoder_update_tree)
+            else:
+                rl_mut = {**rl_encoder_update_tree}
+            rl_params_block = rl_mut.get("params", {})
+            if isinstance(rl_params_block, frozen_dict.FrozenDict):
+                rl_params_block = frozen_dict.unfreeze(rl_params_block)
+            else:
+                rl_params_block = {**rl_params_block}
+            rl_params_block["online_encoder"] = pcgrad_rl
+            rl_mut["params"] = rl_params_block
+            params = optax.apply_updates(params, rl_mut)
+        elif rl_encoder_update is not None and config.orthogonalize_shared_encoder:
+            # RL encoder update was deferred but no SPR encoder update
+            # Apply original RL encoder update
+            rl_encoder_update_tree = jax.tree.map(jnp.zeros_like, params)
+            if isinstance(rl_encoder_update_tree, frozen_dict.FrozenDict):
+                rl_mut = frozen_dict.unfreeze(rl_encoder_update_tree)
+            else:
+                rl_mut = {**rl_encoder_update_tree}
+            rl_params_block = rl_mut.get("params", {})
+            if isinstance(rl_params_block, frozen_dict.FrozenDict):
+                rl_params_block = frozen_dict.unfreeze(rl_params_block)
+            else:
+                rl_params_block = {**rl_params_block}
+            rl_params_block["online_encoder"] = rl_encoder_update
+            rl_mut["params"] = rl_params_block
+            params = optax.apply_updates(params, rl_mut)
+
+        params = optax.apply_updates(params, spr_update_vec)
+
+        # 2. Others
+        if proj_online_state:
+            proj_online_state = proj_online_state.apply_gradients(
+                grads=tree.scale(config.spr_weight, grads_proj)
+            )
+
+        predictor_state = predictor_state.apply_gradients(
+            grads=tree.scale(config.spr_weight, grads_pred)
         )
 
-    q_train_state = train_state.apply_gradients(grads=tree.neg(q_update))
-
-    # Update H-network
-    delta_z_h = tree.scale(td_error, grad_h_trace_t)
-    h_h_grad = tree.scale(-h_t, h_grads)
-    beta_params = tree.scale(-config.reg_coeff, h_params)
-
-    h_update = jax.tree.map(
-        lambda x, y, z: -(x + y + z), delta_z_h, h_h_grad, beta_params
-    )
-
-    h_train_state = agent_state.h_state.apply_gradients(grads=h_update)
-
-    # Update SPR components
-
-    if agent_state.proj_online_state is not None:
-        proj_online_state = agent_state.proj_online_state.apply_gradients(
-            grads=tree.scale(config.spr_weight, spr_grads_proj)
+        transition_state = transition_state.apply_gradients(
+            grads=tree.scale(config.spr_weight, grads_trans)
         )
-    else:
-        proj_online_state = None
 
-    predictor_state = agent_state.predictor_state.apply_gradients(
-        grads=tree.scale(config.spr_weight, spr_grads_pred)
-    )
-    if agent_state.transition_state is not None and spr_grads_trans is not None:
-        transition_state = agent_state.transition_state.apply_gradients(
-            grads=tree.scale(config.spr_weight, spr_grads_trans)
+        # EMA Updates
+        target_encoder_params = ema_update(
+            target_encoder_state.params["params"]["target_encoder"],
+            params["params"]["online_encoder"],
+            config.spr_tau,
         )
-    else:
-        transition_state = agent_state.transition_state
+        target_encoder_state = target_encoder_state.replace(
+            params={"params": {"target_encoder": target_encoder_params}}
+        )
 
-    # EMA update for target networks
-    target_params = ema_update(
-        agent_state.target_encoder_state.params["params"]["target_encoder"],
-        q_train_state.params["params"]["online_encoder"],
-        config.spr_tau,
-    )
-    target_encoder_state = agent_state.target_encoder_state.replace(
-        params={"params": {"target_encoder": target_params}}
-    )
+        if config.shared_online_proj:
+            src_proj = params["params"]["q_projection"]
+        else:
+            src_proj = proj_online_state.params["params"]["proj"]
 
-    proj_target_params = ema_update(
-        agent_state.proj_target_state.params["params"]["proj"],
-        (
-            q_train_state.params["params"]["q_projection"]
-            if config.shared_online_proj
-            else proj_online_state.params["params"]["proj"]
-        ),
-        config.spr_tau,
-    )
-    proj_target_state = agent_state.proj_target_state.replace(
-        params={"params": {"proj": proj_target_params}}
-    )
+        proj_target_params = ema_update(
+            proj_target_state.params["params"]["proj"],
+            src_proj,
+            config.spr_tau,
+        )
+        proj_target_state = proj_target_state.replace(
+            params={"params": {"proj": proj_target_params}}
+        )
 
-    if terminated or truncated or is_nongreedy:
-        h_trace_t = reset_trace(h_trace_t)
-        grad_h_trace_t = reset_trace(grad_h_trace_t)
-        grad_q_trace_t = reset_trace(grad_q_trace_t)
-
-    # Calculate L2 norms for logging
-    q_update_l2 = optax.global_norm(q_update)
-    h_update_l2 = optax.global_norm(h_update)
+    train_state = TrainState(
+        step=train_state.step + 1,
+        apply_fn=train_state.apply_fn,
+        params=params,
+        tx=train_state.tx,
+        opt_state=opt_state,
+    )
 
     metrics = {
         "td_error": td_error,
-        "q_val": q_val,
-        "h_val": h_t,
-        "q_update_l2": q_update_l2,
-        "h_update_l2": h_update_l2,
+        "q_val": q_taken,
         "spr_loss": spr_loss,
-        "mse_loss": mse_loss,
-        "y_magnitude": y_mag,
+        "encoder_update_cos": encoder_update_cos,
     }
-
     return (
         AgentState(
             config,
-            q_train_state,
-            h_train_state,
-            h_trace_t,
-            grad_h_trace_t,
-            grad_q_trace_t,
+            train_state,
             target_encoder_state,
             proj_online_state,
             proj_target_state,
@@ -1219,12 +1218,13 @@ def update_step_qrc_agent(
             spr_momentum_proj,
             spr_momentum_pred,
             spr_momentum_trans,
+            obgd_momentum,
         ),
         metrics,
     )
 
 
-QRCAgent = Agent(init_agent_state_qrc_agent, agent_step, update_step_qrc_agent)
+StreamQAgent = Agent(init_agent_state_streamq, agent_step, update_step_streamq)
 
 
 ###################################################################################
@@ -1249,41 +1249,25 @@ def experiment(args: Args, agent: Agent, run_name: str):
     rng = jax.random.PRNGKey(args.seed)
 
     # Create and initialize the environment (single environment, not vectorized)
-    env = make_env(args, 0, run_name)()
+    env = make_env(args, 0, run_name)
     obs, _ = env.reset(seed=args.seed)
     obs = np.array(obs)
-    if obs.shape == (4, 84, 84):
-        obs = obs.transpose(1, 2, 0)
+    obs = obs.transpose(1, 2, 0)
     episodes = 0
     episode_return = 0.0
     episode_length = 0
 
     # Initialize the agent
     action_dim = int(env.action_space.n)
-    agent_state, rng = agent.init_state(
-        agent_config, action_dim, obs.shape, rng, args.max_grad
-    )
+    agent_state, rng = agent.init_state(agent_config, action_dim, obs.shape, rng)
     epsilon_schedule = get_linear_epsilon_schedule(args)
 
-    # Initialize trajectory buffer for SPR
+    # SPR Buffer
     traj_buffer = TrajectoryBuffer.create(args.spr_prediction_depth, obs.shape)
 
     # Tracking for logging
     start_time = time.time()
     last_log_step = 0
-
-    # Loss accumulators
-    loss_accum = {
-        "td_error": 0.0,
-        "q_val": 0.0,
-        "h_val": 0.0,
-        "q_update_l2": 0.0,
-        "h_update_l2": 0.0,
-        "spr_loss": 0.0,
-        "mse_loss": 0.0,
-        "y_magnitude": 0.0,
-    }
-    loss_count = 0
 
     # List to accumulate all log dictionaries
     all_logs = []
@@ -1310,6 +1294,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
             with open(checkpoint_path, "rb") as f:
                 checkpoint_data = pickle.load(f)
 
+            # Helper to restore state
             def restore_train_state(current, state_bytes):
                 if current is None or state_bytes is None:
                     return current
@@ -1330,19 +1315,6 @@ def experiment(args: Args, agent: Agent, run_name: str):
 
             new_train_state = restore_train_state(
                 agent_state.train_state, checkpoint_data["train_state"]
-            )
-            new_h_state = restore_train_state(
-                agent_state.h_state, checkpoint_data.get("h_state")
-            )
-
-            h_trace = flax.serialization.from_bytes(
-                agent_state.h_trace, checkpoint_data["h_trace"]
-            )
-            grad_h_trace = flax.serialization.from_bytes(
-                agent_state.grad_h_trace, checkpoint_data["grad_h_trace"]
-            )
-            grad_q_trace = flax.serialization.from_bytes(
-                agent_state.grad_q_trace, checkpoint_data["grad_q_trace"]
             )
 
             new_target_encoder_state = restore_train_state(
@@ -1376,14 +1348,14 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 agent_state.spr_momentum_trans,
                 checkpoint_data.get("spr_momentum_trans"),
             )
+            new_obgd_momentum = restore_momentum(
+                agent_state.obgd_momentum,
+                checkpoint_data.get("obgd_momentum"),
+            )
 
             agent_state = AgentState(
                 agent_config=agent_state.agent_config,
                 train_state=new_train_state,
-                h_state=new_h_state,
-                h_trace=h_trace,
-                grad_h_trace=grad_h_trace,
-                grad_q_trace=grad_q_trace,
                 target_encoder_state=new_target_encoder_state,
                 proj_online_state=new_proj_online_state,
                 proj_target_state=new_proj_target_state,
@@ -1393,6 +1365,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 spr_momentum_proj=new_spr_momentum_proj,
                 spr_momentum_pred=new_spr_momentum_pred,
                 spr_momentum_trans=new_spr_momentum_trans,
+                obgd_momentum=new_obgd_momentum,
             )
 
             if "traj_buffer" in checkpoint_data:
@@ -1415,12 +1388,13 @@ def experiment(args: Args, agent: Agent, run_name: str):
         action = action.item()
         is_nongreedy = is_nongreedy.item()
 
+        # Add to SPR buffer
         traj_buffer = traj_buffer.add(obs, action)
 
         next_obs, reward, terminated, truncated, info = env.step(action)
-        next_obs = np.array(next_obs).transpose(
-            1, 2, 0
-        )  # Convert LazyFrames to numpy array and transpose
+        next_obs = np.array(next_obs)
+        next_obs = next_obs.transpose(1, 2, 0)
+
         done = terminated or truncated
 
         episode_return += reward
@@ -1428,31 +1402,23 @@ def experiment(args: Args, agent: Agent, run_name: str):
 
         # Handle final observation for truncated episodes
         real_next_obs = next_obs.copy()
-        # In single env setup without auto-reset, next_obs is already the final observation
         # if truncated:
-        #    real_next_obs = np.array(info["final_observation"]).transpose(
-        #        1, 2, 0
-        #    )
+        #     real_next_obs = np.array(
+        #         info["final_observation"]
+        #     )  # Convert to numpy array
 
         transition = (obs, action, real_next_obs, reward)
 
-        # Split RNG for update
-        rng, rng_update = jax.random.split(rng)
-
+        rng, _rng = jax.random.split(rng)
         agent_state, metrics = agent.update(
             agent_state,
             transition,
             terminated,
             truncated,
             is_nongreedy,
-            traj_buffer,
-            rng_update,
+            traj_buffer=traj_buffer,
+            rng=_rng,
         )
-
-        # Accumulate losses
-        for k in loss_accum:
-            loss_accum[k] += float(metrics.get(k, 0.0))
-        loss_count += 1
 
         if done:
             episodes += 1
@@ -1464,49 +1430,36 @@ def experiment(args: Args, agent: Agent, run_name: str):
 
             next_obs, info = env.reset()
             next_obs = np.array(next_obs)
-            if next_obs.shape == (4, 84, 84):
-                next_obs = next_obs.transpose(1, 2, 0)
-
-        # Check if training is complete (moved outside the if done block)
-        if t >= args.total_timesteps:
-            break
+            next_obs = next_obs.transpose(1, 2, 0)
 
         # Periodic logging every 1000 steps
         if t % 1000 == 0 and t > 0:
             steps_elapsed = t - last_log_step
             sps = int(steps_elapsed / (time.time() - start_time))
 
-            avg_return = np.mean(env.get_wrapper_attr("return_queue"))
-            avg_length = np.mean(env.get_wrapper_attr("length_queue"))
+            if len(env.get_wrapper_attr("return_queue")) > 0:
+                avg_return = np.mean(env.get_wrapper_attr("return_queue"))
+                avg_length = np.mean(env.get_wrapper_attr("length_queue"))
+            else:
+                avg_return = 0.0
+                avg_length = 0.0
 
-            # Calculate average losses
-            avg_losses = {k: v / loss_count for k, v in loss_accum.items()}
-
-            # Reset accumulators
-            for k in loss_accum:
-                loss_accum[k] = 0.0
-            loss_count = 0
-
-            print(
-                f"Step: {t}, Avg Return: {avg_return:.2f}, Avg Length: {avg_length:.2f}, SPS: {sps}, Epsilon: {epsilon:.3f}"
-            )
+            # print(
+            #     f"Step: {t}, Avg Return: {avg_return:.2f}, Avg Length: {avg_length:.2f}, SPS: {sps}, Epsilon: {epsilon:.3f}"
+            # )
 
             # Create log dictionary
             log_dict = {
                 "global_step": t,
                 "avg_return": avg_return,
                 "avg_length": avg_length,
-                "td_loss": avg_losses["td_error"],
-                "q_values": avg_losses["q_val"],
-                "h_values": avg_losses["h_val"],
-                "q_update_l2": avg_losses["q_update_l2"],
-                "h_update_l2": avg_losses["h_update_l2"],
+                "td_loss": float(metrics["td_error"]),
+                "q_values": float(metrics["q_val"]),
+                "spr_loss": float(metrics.get("spr_loss", 0.0)),
+                "encoder_update_cos": float(metrics.get("encoder_update_cos", 0.0)),
                 "SPS": sps,
                 "epsilon": epsilon,
                 "episodes": episodes,
-                "spr_loss": avg_losses["spr_loss"],
-                "mse_loss": avg_losses["mse_loss"],
-                "y_magnitude": avg_losses["y_magnitude"],
             }
 
             wandb.log(
@@ -1518,13 +1471,9 @@ def experiment(args: Args, agent: Agent, run_name: str):
                     "charts/epsilon": epsilon,
                     "losses/td_loss": log_dict["td_loss"],
                     "losses/q_values": log_dict["q_values"],
-                    "losses/h_values": log_dict["h_values"],
-                    "updates/q_update_l2": log_dict["q_update_l2"],
-                    "updates/h_update_l2": log_dict["h_update_l2"],
-                    "episodes": episodes,
                     "losses/spr_loss": log_dict["spr_loss"],
-                    "losses/mse_loss": log_dict["mse_loss"],
-                    "losses/y_magnitude": log_dict["y_magnitude"],
+                    "debug/encoder_cos": log_dict["encoder_update_cos"],
+                    "episodes": episodes,
                 },
                 step=t,
             )
@@ -1535,7 +1484,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
             last_log_step = t
             start_time = time.time()
 
-        # Periodic model checkpointing AND RESUME
+        # Periodic model checkpointing AND RESUME CHECKPOINT
         if (t % checkpointing_frequency == 0 or t % 10000 == 0) and t > 0:
             flush_logs(all_logs, args.log_dir)
             all_logs = []
@@ -1556,10 +1505,6 @@ def experiment(args: Args, agent: Agent, run_name: str):
             checkpoint_data = {
                 "step": t,
                 "train_state": save_train_state(agent_state.train_state),
-                "h_state": save_train_state(agent_state.h_state),
-                "h_trace": flax.serialization.to_bytes(agent_state.h_trace),
-                "grad_h_trace": flax.serialization.to_bytes(agent_state.grad_h_trace),
-                "grad_q_trace": flax.serialization.to_bytes(agent_state.grad_q_trace),
                 "target_encoder_state": save_train_state(
                     agent_state.target_encoder_state
                 ),
@@ -1571,6 +1516,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
                 "spr_momentum_proj": save_momentum(agent_state.spr_momentum_proj),
                 "spr_momentum_pred": save_momentum(agent_state.spr_momentum_pred),
                 "spr_momentum_trans": save_momentum(agent_state.spr_momentum_trans),
+                "obgd_momentum": save_momentum(agent_state.obgd_momentum),
                 "traj_buffer": flax.serialization.to_bytes(traj_buffer),
                 "rng": rng,
                 "episodes": episodes,
@@ -1584,6 +1530,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
             with open(tmp_path, "wb") as f:
                 pickle.dump(checkpoint_data, f)
             os.rename(tmp_path, checkpoint_path)
+            # print(f"Resume checkpoint saved to {checkpoint_path}")
 
         # Periodic model checkpointing
         if (
@@ -1594,11 +1541,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
         ):
             model_path = f"{args.log_dir}/checkpoint_{t}.cleanrl_model"
             with open(model_path, "wb") as f:
-                f.write(
-                    flax.serialization.to_bytes(
-                        [agent_state.train_state.params, agent_state.h_state.params]
-                    )
-                )
+                f.write(flax.serialization.to_bytes([agent_state.train_state.params]))
             print(f"Checkpoint saved to {model_path}")
 
         obs = next_obs
@@ -1607,11 +1550,7 @@ def experiment(args: Args, agent: Agent, run_name: str):
     if args.save_model:
         model_path = f"{args.log_dir}/{args.exp_name}.cleanrl_model"
         with open(model_path, "wb") as f:
-            f.write(
-                flax.serialization.to_bytes(
-                    [agent_state.train_state.params, agent_state.h_state.params]
-                )
-            )
+            f.write(flax.serialization.to_bytes([agent_state.train_state.params]))
         print(f"Final model saved to {model_path}")
 
     # Save logs to CSV
@@ -1698,6 +1637,6 @@ def main(
 if __name__ == "__main__":
     main(
         experiment,
-        QRCAgent,
+        StreamQAgent,
         define_metrics,
     )
