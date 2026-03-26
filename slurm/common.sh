@@ -5,7 +5,7 @@
 module load httpproxy
 module load python/3.10
 
-WANDB_LOG_DIR="~/scratch/wandb_logs"
+WANDB_LOG_DIR="/home/nilaksh/scratch/wandb_logs3"
 
 # check if wandb logging dir exists, if not create it
 if [ ! -d "$WANDB_LOG_DIR" ]; then
@@ -13,7 +13,7 @@ if [ ! -d "$WANDB_LOG_DIR" ]; then
     echo "Created WANDB_DIR at $WANDB_LOG_DIR"
 fi
 
-CHECKPOINT_DIR="~/scratch/stream_rl_checkpoints"
+CHECKPOINT_DIR="/home/nilaksh/scratch/stream_rl_checkpoints3"
 if [ ! -d "$CHECKPOINT_DIR" ]; then
     mkdir -p "$CHECKPOINT_DIR"
     echo "Created CHECKPOINT_DIR at $CHECKPOINT_DIR"
@@ -23,6 +23,9 @@ export WANDB_DIR="$WANDB_LOG_DIR"
 export WANDB_ENTITY=""
 export WANDB_PROJECT="stream-rl-rebuttal"
 export WANDB_MODE=offline
+export WANDB__REQUIRE_ERRORS=false
+export SENTRY_DSN=""
+export WANDB_ERROR_REPORTING=false
 
 if [ $? -ne 0 ]; then
     echo "Module loading failed. Exiting."
